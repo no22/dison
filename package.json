@@ -27,7 +27,12 @@
     "prepare": "npm run build",
     "test": "vitest run"
   },
-  "keywords": ["dependency-injection", "dsl", "transpiler", "typescript"],
+  "keywords": [
+    "dependency-injection",
+    "dsl",
+    "transpiler",
+    "typescript"
+  ],
   "author": "",
   "license": "ISC",
   "devDependencies": {
