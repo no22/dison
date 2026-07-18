@@ -42,17 +42,13 @@ function transpileSingleFile(inputFile: string): void {
 //      パッケージ化に伴いパッケージ自身から読み込む方式に変更した
 //      （docs/packaging.md）。
 //
-// 現状は簡略化のため、すべての入力ファイルが同一ディレクトリにあることを
-// 前提にしている。
+// 以前は共有ランタイム（dison-runtime.ts）をどのディレクトリに書き出すか
+// 曖昧にならないよう、全入力ファイルが同一ディレクトリにあることを要求
+// していた。パッケージ化（docs/packaging.md）でこの書き出し自体をやめ、
+// "dison/runtime" パッケージから直接importする方式に変更したため、
+// その制約の根拠は無くなった。各ファイルは自身のパスを基準に個別に
+// 入出力されるため、異なるディレクトリの入力ファイルを混在させても良い。
 function transpileMultipleFiles(inputFiles: string[]): void {
-  const dirs = new Set(inputFiles.map((f) => path.dirname(path.resolve(f))));
-  if (dirs.size > 1) {
-    throw new Error(
-      `When passing multiple files, they must currently all be in the same directory` +
-        ` (directories given: ${[...dirs].join(', ')})`
-    );
-  }
-
   const fileInputs = inputFiles.map((inputFile) => ({
     path: inputFile,
     source: fs.readFileSync(inputFile, 'utf-8'),

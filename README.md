@@ -171,10 +171,12 @@ Pass more than one file to the CLI to transpile a project as a unit:
 npx dison a.dis b.dis c.dis
 ```
 
-All input files must currently live in the same directory. Their
-generated output shares override/bind state through the `dison/runtime`
-package export, so an `override`/`bind` activated in one file is
-visible from classes defined in another.
+Input files can live in different directories. Their generated output
+shares override/bind state through the `dison/runtime` package export,
+so an `override`/`bind` activated in one file is visible from classes
+defined in another — as long as they all resolve `dison/runtime` to
+the same installed copy (in practice: they're part of the same project
+and share a common `node_modules` ancestor, which is the normal case).
 
 ## License
 
