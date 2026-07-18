@@ -1,0 +1,31 @@
+import { UserRepoToken } from "./tokens";
+
+// This module declares its own IRepository — unaware that
+// admin-module.dis declares an unrelated interface with the exact
+// same name. If BOTH modules used a plain (untokened) IRepository,
+// the CLI's cross-file collision check would refuse to transpile the
+// project at all (try removing every "as ...Token" clause from both
+// this file and admin-module.dis to see the build error).
+export interface IRepository {
+  whoAmI(): string;
+}
+
+export class SqlUserRepository implements IRepository {
+  whoAmI() {
+    return "real user repository";
+  }
+}
+
+class MockUserRepository implements IRepository {
+  whoAmI() {
+    return "mock user repository";
+  }
+}
+
+export class UserService {
+  injectable repo: IRepository as UserRepoToken = new SqlUserRepository();
+}
+
+configuration UseMockUserRepo {
+  bind IRepository as UserRepoToken = MockUserRepository;
+}

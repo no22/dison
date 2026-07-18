@@ -1,0 +1,48 @@
+// Dison's core dependency-injection pattern: injectable + override +
+// configuration + activate, all in a single file.
+//
+// Run it:
+//   npx dison sample/01-basic-di.dis
+//   npx tsx sample/01-basic-di.ts
+
+// A concrete class can be injected with no extra syntax — Dison
+// auto-generates `new SqlUserRepository()` as the default factory.
+class SqlUserRepository {
+  findById(id: string): { id: string; name: string } {
+    return { id, name: "real user " + id };
+  }
+}
+
+// A mock implementation, swapped in below via `override`.
+class MockUserRepository extends SqlUserRepository {
+  findById(id: string): { id: string; name: string } {
+    return { id, name: "mock user " + id };
+  }
+}
+
+class UserService {
+  injectable repo: SqlUserRepository;
+
+  greet(id: string): string {
+    return `Hello, ${this.repo.findById(id).name}!`;
+  }
+}
+
+// Before any configuration is activated, `repo` resolves to the real
+// SqlUserRepository.
+console.log("default:      " + new UserService().greet("1"));
+
+// A `configuration` groups a set of overrides and only takes effect
+// once explicitly activated.
+configuration TestConfig {
+  override UserService {
+    repo = new MockUserRepository();
+  }
+}
+
+activate TestConfig;
+
+// Same class, same property — now resolves to the mock instead,
+// because the injectable getter is lazy and checks the override
+// registry every time it's not yet resolved for that instance.
+console.log("after activate: " + new UserService().greet("1"));

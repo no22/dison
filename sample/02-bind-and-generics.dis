@@ -1,0 +1,65 @@
+// `bind` replaces a type everywhere it's requested, not just one
+// property the way `override` does. This example also shows generics
+// and bind chaining.
+//
+// Run it:
+//   npx dison sample/02-bind-and-generics.dis
+//   npx tsx sample/02-bind-and-generics.ts
+
+interface Repository<T> {
+  find(): T;
+}
+
+class RealUserRepository implements Repository<{ id: string }> {
+  find() {
+    return { id: "real" };
+  }
+}
+
+class MockUserRepository implements Repository<{ id: string }> {
+  find() {
+    return { id: "mock" };
+  }
+}
+
+// Interface types can't be auto-constructed with `new`, so a default
+// initializer ("= <expr>") is required here.
+class UserService {
+  injectable repo: Repository<{ id: string }> = new RealUserRepository();
+}
+
+configuration TestConfig {
+  // Only this exact instantiation, Repository<{ id: string }>, is bound.
+  // A different instantiation of the same generic interface would need
+  // its own separate `bind`.
+  bind Repository<{ id: string }> = MockUserRepository;
+}
+
+activate TestConfig;
+
+console.log("bound repo:", new UserService().repo.find()); // { id: "mock" }
+
+// bind also chains: resolving A eventually walks through to whatever
+// B (and then C, and so on) ultimately resolves to.
+class A {
+  label = "A";
+}
+class B extends A {
+  label = "B";
+}
+class C extends B {
+  label = "C";
+}
+
+class Chained {
+  injectable value: A = new A();
+}
+
+configuration ChainConfig {
+  bind A = B;
+  bind B = C;
+}
+
+activate ChainConfig;
+
+console.log("chained bind resolves to:", new Chained().value.label); // "C"

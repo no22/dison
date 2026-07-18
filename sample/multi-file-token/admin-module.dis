@@ -1,0 +1,28 @@
+import { AdminRepoToken } from "./tokens";
+
+// A second, completely unrelated module that happens to declare its
+// own IRepository interface too. Thanks to the tokens, it never
+// collides with user-module.dis's IRepository.
+export interface IRepository {
+  whoAmI(): string;
+}
+
+export class SqlAdminRepository implements IRepository {
+  whoAmI() {
+    return "real admin repository";
+  }
+}
+
+class MockAdminRepository implements IRepository {
+  whoAmI() {
+    return "mock admin repository";
+  }
+}
+
+export class AdminService {
+  injectable repo: IRepository as AdminRepoToken = new SqlAdminRepository();
+}
+
+configuration UseMockAdminRepo {
+  bind IRepository as AdminRepoToken = MockAdminRepository;
+}

@@ -178,6 +178,13 @@ defined in another — as long as they all resolve `dison/runtime` to
 the same installed copy (in practice: they're part of the same project
 and share a common `node_modules` ancestor, which is the normal case).
 
+## Samples
+
+See [`sample/`](sample/) for runnable, self-contained examples covering
+`injectable`/`override`/`activate`, `bind` (including generics and
+chaining), and a multi-file project using `token` to disambiguate
+same-named interfaces across files.
+
 ## License
 
 ISC

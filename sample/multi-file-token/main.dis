@@ -1,0 +1,18 @@
+// Run this whole example:
+//   npx dison sample/multi-file-token/tokens.dis sample/multi-file-token/user-module.dis sample/multi-file-token/admin-module.dis sample/multi-file-token/main.dis
+//   npx tsx sample/multi-file-token/main.ts
+//
+// (dison must be installed as a dependency of this project, since the
+// generated files import their shared runtime from "dison/runtime".)
+
+import { UserService } from "./user-module";
+import { AdminService } from "./admin-module";
+
+// activate ... from "..." activates a configuration defined in
+// another file without you needing to know or import its generated
+// function name.
+activate UseMockUserRepo from "./user-module";
+activate UseMockAdminRepo from "./admin-module";
+
+console.log("user:", new UserService().repo.whoAmI());
+console.log("admin:", new AdminService().repo.whoAmI());
