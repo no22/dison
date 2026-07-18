@@ -1,0 +1,47 @@
+{
+  // Visit https://aka.ms/tsconfig to read more about this file
+  "compilerOptions": {
+    // File Layout
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    // Environment Settings
+    // See also https://aka.ms/tsconfig/module
+    "module": "nodenext",
+    "target": "ES2022",
+    "types": ["node"],
+
+    // Other Outputs
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // Stricter Typechecking Options
+    // 以下2つはこれまでの開発・検証（毎回 `tsc --strict` のみで確認していた）
+    // では一度も有効化されたことがなく、実際に本番ビルドで通してみると
+    // 既存のトークン列走査ロジック（analysis.ts/lexer.ts/parser.ts）全体に
+    // 大量の書き換えが必要になることが判明した。パッケージ化の範囲外の
+    // 大改修になるため、実際に検証してきた厳格さ（strict相当）に合わせて
+    // 無効化しておく。
+    // "noUncheckedIndexedAccess": true,
+    // "exactOptionalPropertyTypes": true,
+
+    // Style Options
+    // "noImplicitReturns": true,
+    // "noImplicitOverride": true,
+    // "noUnusedLocals": true,
+    // "noUnusedParameters": true,
+    // "noFallthroughCasesInSwitch": true,
+    // "noPropertyAccessFromIndexSignature": true,
+
+    // Recommended Options
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/test-helpers.ts"]
+}
