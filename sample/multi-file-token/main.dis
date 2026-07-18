@@ -2,8 +2,8 @@
 //   npx dison sample/multi-file-token/tokens.dis sample/multi-file-token/user-module.dis sample/multi-file-token/admin-module.dis sample/multi-file-token/main.dis
 //   npx tsx sample/multi-file-token/main.ts
 //
-// (dison must be installed as a dependency of this project, since the
-// generated files import their shared runtime from "dison/runtime".)
+// (@no22/dison must be installed as a dependency of this project, since
+// the generated files import their shared runtime from "@no22/dison/runtime".)
 
 import { UserService } from "./user-module";
 import { AdminService } from "./admin-module";

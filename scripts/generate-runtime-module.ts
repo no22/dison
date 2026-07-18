@@ -1,4 +1,4 @@
-// "dison/runtime" サブパスとして配布する共有ランタイムモジュールの実体
+// "@no22/dison/runtime" サブパスとして配布する共有ランタイムモジュールの実体
 // （src/generated-runtime.ts）を、DISON_RUNTIME_MODULE_SOURCE（src/runtime.ts）
 // から書き出す。ビルドの最初のステップとして実行し、その後tscがdist/に
 // コンパイルする（docs/packaging.md）。

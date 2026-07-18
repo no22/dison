@@ -74,7 +74,7 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
 // 複数ファイルでランタイム状態（DI_REGISTRY/TYPE_BINDINGS）を共有するための
 // 共有ランタイムモジュールのソース。scripts/generate-runtime-module.tsが
 // これをsrc/generated-runtime.tsとして書き出し、tscがdist/にコンパイルする
-// ことで、"dison/runtime" として配布される（docs/packaging.md）。
+// ことで、"@no22/dison/runtime" として配布される（docs/packaging.md）。
 export const DISON_RUNTIME_MODULE_SOURCE: string =
   `// --- Dison shared runtime module ---\n` +
   `// Multiple generated files import this module to share runtime state\n` +

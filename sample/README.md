@@ -44,11 +44,11 @@ naming collision that the CLI refuses to build (see the comment in
 `user-module.dis`); tokens let both modules use `IRepository` safely
 side by side.
 
-This example needs `dison` itself installed as a dependency, since the
-generated files import their shared runtime from `"dison/runtime"`. If
-you're running this from inside a clone of the Dison repo itself,
-`npm link` (once, globally) and then `npm link dison` (in this repo)
-sets that up.
+This example needs `@no22/dison` itself installed as a dependency,
+since the generated files import their shared runtime from
+`"@no22/dison/runtime"`. If you're running this from inside a clone of
+the Dison repo itself, `npm link` (once, globally) and then
+`npm link @no22/dison` (in this repo) sets that up.
 
 ```bash
 npx dison sample/multi-file-token/tokens.dis sample/multi-file-token/user-module.dis sample/multi-file-token/admin-module.dis sample/multi-file-token/main.dis

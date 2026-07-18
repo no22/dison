@@ -4,11 +4,13 @@ import * as path from 'path';
 import { transpileDisonToTS, findBindCollisions } from './core.js'; // ※NodeNext環境のために.jsをつけます
 
 // 複数ファイルの生成コードが共有ランタイム（DI_REGISTRY/TYPE_BINDINGS等）を
-// importする際に使うパッケージのサブパス。disonパッケージ自身がこの下に
-// 実体（src/generated-runtime.ts→dist/generated-runtime.js）を配布している
-// ため、変換対象のプロジェクトは"dison"を依存関係としてインストールして
-// いる必要がある（docs/packaging.md）。
-const RUNTIME_PACKAGE_SPECIFIER = 'dison/runtime';
+// importする際に使うパッケージのサブパス。@no22/disonパッケージ自身が
+// この下に実体（src/generated-runtime.ts→dist/generated-runtime.js）を
+// 配布しているため、変換対象のプロジェクトは"@no22/dison"を依存関係として
+// インストールしている必要がある（docs/packaging.md）。パッケージ名が
+// "@no22/dison"なのはnpmの類似名ポリシー（jison/bson/json等と類似と
+// 判定された）により無scope名"dison"では公開できなかったため。
+const RUNTIME_PACKAGE_SPECIFIER = '@no22/dison/runtime';
 
 function outputPathFor(inputFile: string): string {
   const ext = path.extname(inputFile);
@@ -33,8 +35,8 @@ function transpileSingleFile(inputFile: string): void {
 //      （findBindCollisions、案D）。1件でも見つかればどのファイルも
 //      書き出さずに中断する（部分的に生成された不整合な状態を残さないため）。
 //   2. 問題が無ければ、各ファイルを独立にトランスパイルする。ランタイムの
-//      前置き（DI_REGISTRY/TYPE_BINDINGS等）は各生成ファイルが"dison/runtime"
-//      パッケージから直接importする。これによりファイルを跨いだ
+//      前置き（DI_REGISTRY/TYPE_BINDINGS等）は各生成ファイルが
+//      "@no22/dison/runtime" パッケージから直接importする。これによりファイルを跨いだ
 //      override/bind/activateが正しく効くようになる（1ファイルずつ独立に
 //      トランスパイルすると、それぞれが自分専用のDI_REGISTRY/TYPE_BINDINGSを
 //      持ってしまい、互いに影響しない）。以前はこのランタイムを出力先
@@ -45,7 +47,7 @@ function transpileSingleFile(inputFile: string): void {
 // 以前は共有ランタイム（dison-runtime.ts）をどのディレクトリに書き出すか
 // 曖昧にならないよう、全入力ファイルが同一ディレクトリにあることを要求
 // していた。パッケージ化（docs/packaging.md）でこの書き出し自体をやめ、
-// "dison/runtime" パッケージから直接importする方式に変更したため、
+// "@no22/dison/runtime" パッケージから直接importする方式に変更したため、
 // その制約の根拠は無くなった。各ファイルは自身のパスを基準に個別に
 // 入出力されるため、異なるディレクトリの入力ファイルを混在させても良い。
 function transpileMultipleFiles(inputFiles: string[]): void {
@@ -63,7 +65,7 @@ function transpileMultipleFiles(inputFiles: string[]): void {
     );
   }
 
-  console.log(`🎉 Using "${RUNTIME_PACKAGE_SPECIFIER}" as the shared runtime (the target project must have "dison" installed as a dependency).`);
+  console.log(`🎉 Using "${RUNTIME_PACKAGE_SPECIFIER}" as the shared runtime (the target project must have "@no22/dison" installed as a dependency).`);
 
   for (const file of fileInputs) {
     const generatedTS = transpileDisonToTS(file.source, { runtimeModulePath: RUNTIME_PACKAGE_SPECIFIER });

@@ -14,11 +14,15 @@ declarations; you never touch the registry directly.
 ## Install
 
 ```bash
-npm install dison
+npm install @no22/dison
 ```
 
+(The package is published as `@no22/dison` — npm's name-similarity
+policy rejected the unscoped name `dison` as too close to existing
+packages. The CLI command itself is still just `dison`.)
+
 This gives you the `dison` CLI (via `npx dison`) and, for multi-file
-projects, a shared runtime importable as `dison/runtime`.
+projects, a shared runtime importable as `@no22/dison/runtime`.
 
 ## Quick start
 
@@ -172,10 +176,10 @@ npx dison a.dis b.dis c.dis
 ```
 
 Input files can live in different directories. Their generated output
-shares override/bind state through the `dison/runtime` package export,
-so an `override`/`bind` activated in one file is visible from classes
-defined in another — as long as they all resolve `dison/runtime` to
-the same installed copy (in practice: they're part of the same project
+shares override/bind state through the `@no22/dison/runtime` package
+export, so an `override`/`bind` activated in one file is visible from
+classes defined in another — as long as they all resolve
+`@no22/dison/runtime` to the same installed copy (in practice: they're part of the same project
 and share a common `node_modules` ancestor, which is the normal case).
 
 ## Samples

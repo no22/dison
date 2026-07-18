@@ -1,5 +1,5 @@
 {
-  "name": "dison",
+  "name": "@no22/dison",
   "version": "1.0.0",
   "type": "module",
   "description": "An experimental DSL that transpiles to TypeScript, with property injection built into the language itself.",
@@ -22,6 +22,9 @@
     "dist",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/no22/dison.git"
