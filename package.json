@@ -22,6 +22,14 @@
     "dist",
     "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/no22/dison.git"
+  },
+  "homepage": "https://github.com/no22/dison#readme",
+  "bugs": {
+    "url": "https://github.com/no22/dison/issues"
+  },
   "scripts": {
     "build": "rm -rf dist && tsx scripts/generate-runtime-module.ts && tsc",
     "prepare": "npm run build",
@@ -33,7 +41,7 @@
     "transpiler",
     "typescript"
   ],
-  "author": "",
+  "author": "OHARA Hiroyuki",
   "license": "ISC",
   "devDependencies": {
     "@types/node": "^26.1.1",
