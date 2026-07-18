@@ -6,7 +6,7 @@
   "main": "./dist/core.js",
   "types": "./dist/core.d.ts",
   "bin": {
-    "dison": "./dist/cli.js"
+    "dison": "dist/cli.js"
   },
   "exports": {
     ".": {
@@ -31,7 +31,7 @@
     "url": "https://github.com/no22/dison/issues"
   },
   "scripts": {
-    "build": "rm -rf dist && tsx scripts/generate-runtime-module.ts && tsc",
+    "build": "rm -rf dist && tsx scripts/generate-runtime-module.ts && tsc && chmod +x dist/cli.js",
     "prepare": "npm run build",
     "test": "vitest run"
   },
