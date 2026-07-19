@@ -9,8 +9,8 @@ class Db {}
 class MockDb extends Db {}
 function f() { configuration { bind Db = MockDb; } }
 `);
-    expect(out).toContain("using __dison_scope_0 = __disonEnterScope((__disonBind, __disonOverride) => {");
-    expect(out).toContain("__disonBind(Db, (): Db => resolveType(MockDb, () => new MockDb()));");
+    expect(out).toContain("using __dison_scope_0 = __disonEnterScopeLazy((__disonBind, __disonOverride) => {");
+    expect(out).toContain("__disonBind(() => Db, (): Db => resolveType(MockDb, () => new MockDb()));");
   });
 
   it("ローカルスコープ内では bind が効き、スコープ外ではグローバル（既定）に戻る", () => {
@@ -121,8 +121,8 @@ class Db {}
 class ClassDb extends Db {}
 class S { injectable db: Db; configuration { bind Db = ClassDb; } }
 `);
-    expect(out).toContain("static __dison_classScope_0 = __disonBuildFrame((__disonBind, __disonOverride) => {");
-    expect(out).toContain("__disonBind(Db, (): Db => resolveType(ClassDb, () => new ClassDb()));");
+    expect(out).toContain("static __dison_classScope_0 = __disonBuildFrameLazy((__disonBind, __disonOverride) => {");
+    expect(out).toContain("__disonBind(() => Db, (): Db => resolveType(ClassDb, () => new ClassDb()));");
   });
 
   it("クラススコープの bind がそのクラスのインスタンスの解決に効く", () => {
@@ -232,7 +232,7 @@ class Mock extends Base {}
 configuration { bind Base = Mock; }
 `);
     // 関数化されず、その場に即時のグローバル bindType 呼び出しが出る（using脱糖はしない）。
-    expect(out).toContain("bindType<Base>(Base, () => resolveType(Mock, () => new Mock()));");
+    expect(out).toContain("bindTypeLazy<Base>(() => Base, () => resolveType(Mock, () => new Mock()));");
     expect(out).not.toContain("function activate");
     expect(out).not.toContain("using __dison_scope");
   });

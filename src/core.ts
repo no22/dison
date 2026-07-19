@@ -345,8 +345,8 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   const header = `// --- Auto-generated TypeScript code ---\n\n`;
   const prelude = options.runtimeModulePath
     ? `${header}${DISON_RUNTIME_IMPORTS}import {\n` +
-      `  bindType,\n  resolveType,\n  registerOverride,\n` +
-      `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScope,\n  __disonBuildFrame,\n` +
+      `  bindTypeLazy,\n  resolveType,\n  registerOverrideLazy,\n` +
+      `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScopeLazy,\n  __disonBuildFrameLazy,\n` +
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
     : `${header}${DISON_RUNTIME_IMPORTS}\n${generateRuntimeDeclarations("")}\n`;
 

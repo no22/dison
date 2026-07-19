@@ -51,8 +51,8 @@ export function extractKeys(generatedTs: string): string[] {
         continue;
       }
     }
-    if (generatedTs.startsWith("bindType<", i)) {
-      let j = i + "bindType<".length;
+    if (generatedTs.startsWith("bindTypeLazy<", i)) {
+      let j = i + "bindTypeLazy<".length;
       let depth = 1;
       while (j < generatedTs.length && depth > 0) {
         if (generatedTs[j] === "<") depth++;
@@ -60,7 +60,11 @@ export function extractKeys(generatedTs: string): string[] {
         j++;
       }
       while (j < generatedTs.length && generatedTs[j] !== "(") j++;
-      const lit = readStringLiteral(generatedTs, j + 1);
+      // キーはサンク "(() => <キー式>" で渡される（docs/config-forward-reference.md）。
+      // 文字列リテラルキーの手前の "() => " を読み飛ばす。
+      let k = j + 1;
+      while (k < generatedTs.length && generatedTs[k] !== '"' && generatedTs[k] !== ",") k++;
+      const lit = readStringLiteral(generatedTs, k);
       if (lit) {
         keys.push(lit.value);
         i = lit.end;

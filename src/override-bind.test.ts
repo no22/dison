@@ -13,7 +13,7 @@ configuration Cfg {
   }
 }
 `);
-    expect(out).toContain('registerOverride(S, "dep", () => (Mock));');
+    expect(out).toContain('registerOverrideLazy(() => S, "dep", () => (Mock));');
   });
 
   it("override対象クラス名がスコープに無い（タイプミス）場合はtscが検出する", () => {
@@ -28,7 +28,7 @@ configuration Cfg {
   }
 }
 `);
-    expect(out).toContain("registerOverride(Servcie,");
+    expect(out).toContain("registerOverrideLazy(() => Servcie,");
   });
 });
 
@@ -44,7 +44,7 @@ configuration Cfg {
     // Real / Mock はどちらも具象クラスなので、"Real"/"Mock" ではなくクラスの
     // 実体参照そのものがキーになる。これにより複数ファイルで同名クラスが
     // 衝突しなくなる（手動tokenが不要）。
-    expect(out).toContain('bindType<Real>(Real, () => resolveType(Mock, () => new Mock()));');
+    expect(out).toContain('bindTypeLazy<Real>(() => Real, () => resolveType(Mock, () => new Mock()));');
   });
 
   it("injectableの具象クラス型も実体参照キーになり、bindの左辺と一致する", () => {
@@ -56,7 +56,7 @@ configuration Cfg { bind Real = Mock; }
 `);
     // injectable側 resolveType のキーも bind側 bindType のキーも同じ実体 Real。
     expect(out).toContain("resolveType(Real, () => new Real())");
-    expect(out).toContain("bindType<Real>(Real,");
+    expect(out).toContain("bindTypeLazy<Real>(() => Real,");
   });
 
   it("interface/型エイリアスは companion Symbol でキー化される（案A(b)）", () => {
@@ -68,7 +68,7 @@ configuration Cfg { bind IRepo = Impl; }
     // 左辺 IRepo は interface なので companion Symbol（宣言に対し自動生成）をキーに、
     // 差し替え先 Impl は具象クラスなので実体キー。DI利用されるので companion が emit される。
     expect(out).toContain('export const __dison_token_IRepo = Symbol("IRepo");');
-    expect(out).toContain('bindType<IRepo>(__dison_token_IRepo, () => resolveType(Impl, () => new Impl()));');
+    expect(out).toContain('bindTypeLazy<IRepo>(() => __dison_token_IRepo, () => resolveType(Impl, () => new Impl()));');
   });
 
   it("abstract class は実行時に値を持つので companion ではなく実体参照キーになる", () => {
@@ -82,7 +82,7 @@ configuration Cfg { bind Repo = Mock; }
     // abstract class は new 不可だが値を持つため実体キー（companion は生成しない）。
     expect(out).not.toContain("__dison_token_Repo");
     expect(out).toContain("resolveType(Repo, () => (new Real()))");
-    expect(out).toContain("bindType<Repo>(Repo, () => resolveType(Mock, () => new Mock()));");
+    expect(out).toContain("bindTypeLazy<Repo>(() => Repo, () => resolveType(Mock, () => new Mock()));");
   });
 
   it("DI利用されないローカルinterfaceには companion を emit しない（案2: DI利用のみ）", () => {
@@ -170,7 +170,7 @@ interface IRepo {}
 class Impl implements IRepo { constructor(x: number) {} }
 configuration Cfg { bind IRepo as IRepoToken = Impl(42); }
 `);
-    expect(out).toContain("bindType<IRepo>(IRepoToken, () => resolveType(Impl, () => new Impl(42)))");
+    expect(out).toContain("bindTypeLazy<IRepo>(() => IRepoToken, () => resolveType(Impl, () => new Impl(42)))");
   });
 
   it("引数リストが閉じていないとパースエラーになる", () => {
@@ -190,7 +190,7 @@ configuration Cfg {
   bind Repository<{ id: string }> = Impl;
 }
 `);
-    expect(out).toContain("bindType<Repository<{ id: string }>>(");
+    expect(out).toContain("bindTypeLazy<Repository<{ id: string }>>(");
   });
 
   it("型引数ごとに別々のbindが両立する", () => {
@@ -216,7 +216,7 @@ configuration Cfg {
   bind Handler<(x: number) => void> = ConcreteHandler;
 }
 `);
-    expect(out).toContain("bindType<Handler<(x: number) => void>>(");
+    expect(out).toContain("bindTypeLazy<Handler<(x: number) => void>>(");
   });
 });
 
@@ -260,7 +260,7 @@ class Base { name = "default"; }
 class Mock extends Base { name = "mock"; }
 bind Base = Mock;
 `);
-    expect(out).toContain('bindType<Base>(Base, () => resolveType(Mock, () => new Mock()));');
+    expect(out).toContain('bindTypeLazy<Base>(() => Base, () => resolveType(Mock, () => new Mock()));');
     expect(out).not.toContain("function activate");
   });
 
@@ -273,7 +273,7 @@ function f() {
 }
 `);
     expect(out).toContain("function f() {");
-    expect(out).toContain('registerOverride(S, "dep", () => (new Mock()));');
+    expect(out).toContain('registerOverrideLazy(() => S, "dep", () => (new Mock()));');
     expect(out).not.toContain("function activate");
   });
 

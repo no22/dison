@@ -52,16 +52,18 @@ function keyExprFor(typeKey: string, token: string | undefined, strategy: KeyStr
 // override 1件分のDI_REGISTRY代入文を生成する。configuration内（関数本体に
 // 収集される場合）と、configurationで包まない単独のoverride（その場に直接
 // 出力される場合）の両方から共有される。
-// local=false: グローバルレジストリへ登録（registerOverride）。local=true: ローカル
-// スコープフレームへ登録（__disonOverride。__disonEnterScope の setup 内で使う）。
+// local=false: グローバルレジストリへ登録（registerOverrideLazy）。local=true: ローカル
+// スコープフレームへ登録（__disonOverride。__disonEnterScopeLazy の setup 内で使う）。
+// 対象クラスはサンク（() => Class）で渡し、評価を初回参照時まで遅延する
+// （後方宣言クラスへの前方参照を可能にする。docs/config-forward-reference.md）。
 function generateOverrideEntryLines(entry: OverrideEntry, local: boolean): string[] {
   // entry.className はクラスの実体を指す識別子としてそのまま埋め込む
   // （文字列リテラルにはしない）。キーがクラスの実体そのものなので、className が
   // スコープ内に存在しない（タイプミス・importし忘れ）場合は tsc が "Cannot find name"
-  // として検出する。
-  const fn = local ? "__disonOverride" : "registerOverride";
+  // として検出する（サンク内でも同様に検出される）。
+  const fn = local ? "__disonOverride" : "registerOverrideLazy";
   return entry.assignments.map(
-    (a) => `  ${fn}(${entry.className}, "${a.prop}", () => (${a.valueExpr}));`
+    (a) => `  ${fn}(() => ${entry.className}, "${a.prop}", () => (${a.valueExpr}));`
   );
 }
 
@@ -91,11 +93,14 @@ function generateOverrideEntryLines(entry: OverrideEntry, local: boolean): strin
 // 連鎖: 差し替え先クラス自身がさらに bind されている可能性があるので、
 // 直接 new せず resolveType を介して再帰的に解決する。
 // （bind A = B; bind B = C; と書けば、Aの解決は最終的にCまで辿る）
-// local=false: グローバル TYPE_BINDINGS へ登録（bindType<T>）。local=true: ローカル
-// スコープフレームへ登録（__disonBind。__disonEnterScope の setup 内で使う）。
-// bindType<T> は型引数で差し替え先の型互換を tsc に検査させるが、__disonBind は
+// local=false: グローバル TYPE_BINDINGS へ登録（bindTypeLazy<T>）。local=true: ローカル
+// スコープフレームへ登録（__disonBind。__disonEnterScopeLazy の setup 内で使う）。
+// bindTypeLazy<T> は型引数で差し替え先の型互換を tsc に検査させるが、__disonBind は
 // 型引数を取れないため、代わりに factory の返り値型注釈 `(): OrigType =>` で同じ検査を
 // 得る（差し替え先が OrigType と非互換なら tsc がエラーにする）。
+// 左辺キーはサンク（() => Key）で渡し、評価を初回参照時まで遅延する
+// （後方宣言クラスへの前方参照を可能にする。docs/config-forward-reference.md）。
+// 差し替え先キーは factory 内にあり元々遅延評価される。
 function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy, local: boolean): string[] {
   const originalKeyExpr = keyExprFor(entry.originalTypeKey, entry.token, strategy);
   // 差し替え先（replacement）は `new` で実体化される具象クラスなので、それ自身が
@@ -108,8 +113,8 @@ function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy, local: 
   const factory = `resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}(${args}))`;
   return [
     local
-      ? `  __disonBind(${originalKeyExpr}, (): ${entry.originalTypeName} => ${factory});`
-      : `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => ${factory});`,
+      ? `  __disonBind(() => ${originalKeyExpr}, (): ${entry.originalTypeName} => ${factory});`
+      : `  bindTypeLazy<${entry.originalTypeName}>(() => ${originalKeyExpr}, () => ${factory});`,
   ];
 }
 
@@ -144,7 +149,7 @@ function generateConfiguration(
     // スコープを関数専有のマイクロタスク実行に隔離し呼び出し元への漏れを防ぐ
     // （暗黙のサスペンションポイント。docs/async-local-scope.md §2）。
     const enter =
-      `__disonEnterScope((__disonBind, __disonOverride) => {\n` +
+      `__disonEnterScopeLazy((__disonBind, __disonOverride) => {\n` +
       `${lines.join("\n")}\n})`;
     return node.asyncScope === true
       ? `using __dison_scope_${scopeId} = (await null, ${enter});`
@@ -154,7 +159,7 @@ function generateConfiguration(
     // 無名クラス configuration。クラス本体の static フィールドとしてフレームを構築する。
     // __disonClassScopes が this.constructor のプロトタイプ鎖からこの static を集める。
     return (
-      `static __dison_classScope_${scopeId} = __disonBuildFrame((__disonBind, __disonOverride) => {\n` +
+      `static __dison_classScope_${scopeId} = __disonBuildFrameLazy((__disonBind, __disonOverride) => {\n` +
       `${lines.join("\n")}\n});`
     );
   }

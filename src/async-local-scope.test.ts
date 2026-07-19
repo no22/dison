@@ -7,8 +7,8 @@ import { runGenerated } from "./test-helpers";
 // 脱糖され、enterWithが関数専有のマイクロタスク実行で走る（呼び出し元へ漏れない）。
 // ジェネレータ（sync/async）本体ではtranspile時エラー。
 
-const AWAIT_FORM = "= (await null, __disonEnterScope(";
-const SYNC_FORM = "= __disonEnterScope(";
+const AWAIT_FORM = "= (await null, __disonEnterScopeLazy(";
+const SYNC_FORM = "= __disonEnterScopeLazy(";
 
 describe("脱糖形の切り替え（囲み関数種別の判定）", () => {
   it("async関数本体では (await null, ...) 形になる", () => {

@@ -32,7 +32,7 @@ configuration Cfg { bind IRepository as IRepositoryToken = Mock; }
 `);
     // 左辺のキーはトークン（IRepositoryToken）。差し替え先 Mock は具象クラスなので
     // 実体参照キー（resolveType(Mock, ...)）になる。
-    expect(out).toContain('bindType<IRepository>(IRepositoryToken, () => resolveType(Mock,');
+    expect(out).toContain('bindTypeLazy<IRepository>(() => IRepositoryToken, () => resolveType(Mock,');
   });
 
   it("as句が無いローカルinterfaceは companion Symbol でキー化される（案A(b)）", () => {

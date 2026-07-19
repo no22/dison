@@ -18,6 +18,13 @@
 // 現在のフレームを捕捉し、解決時にそのフレームへ再突入する（遅延構築される依存グラフ
 // 全体が root の構築スコープに一貫して従う）。ローカルスコープは `using` 宣言で入り、
 // 囲みブロックの終端で自動的に元に戻る（Symbol.dispose）。
+//
+// 前方参照対応（docs/config-forward-reference.md）: 登録はFIFOキューに積まれ、
+// レジストリを読むたびにドレインされる。キー式はサンクで渡され初回参照時まで
+// 評価が遅延されるため、同一ファイル内で後方宣言されたクラスをconfigurationが
+// 前方参照できる（TDZを踏まない）。seq比較により同一キーへの複数登録の最終状態は
+// 常にソース実行順どおりになる。旧シグネチャ（bindType/registerOverride/
+// __disonEnterScope/__disonBuildFrame）は互換のため残し、内部でキュー経由になる。
 
 // スコープ対応に必要な import（AsyncLocalStorage）。生成物のファイル先頭に置く必要が
 // あるため、宣言本体（generateRuntimeDeclarations）とは分けて提供する。単一ファイル
@@ -27,14 +34,62 @@ export const DISON_RUNTIME_IMPORTS = `import { AsyncLocalStorage } from "node:as
 export function generateRuntimeDeclarations(exportKeyword: "" | "export "): string {
   const E = exportKeyword;
   return (
-    `// --- scope infrastructure (docs/scoped-configuration.md) ---\n` +
+    `// --- registration queue (docs/config-forward-reference.md) ---\n` +
+    `// Registrations are queued (with a global sequence number) and applied lazily the\n` +
+    `// first time a registry is read. Key expressions are passed as thunks, so a\n` +
+    `// configuration may forward-reference a class declared later in the same file\n` +
+    `// without hitting the temporal dead zone. A thunk that still throws ReferenceError\n` +
+    `// stays queued and is retried on the next read; seq comparison guarantees that the\n` +
+    `// final state for a key always follows source execution order, and that a blocked\n` +
+    `// entry never delays unrelated keys.\n` +
     `type __DisonFactory = () => any;\n` +
     `type __DisonKey = string | symbol | Function;\n` +
-    `interface __DisonFrame {\n` +
-    `  binds: Map<__DisonKey, __DisonFactory>;\n` +
-    `  overrides: WeakMap<Function, Record<string, __DisonFactory>>;\n` +
+    `type __DisonSlot = { f: __DisonFactory; seq: number };\n` +
+    `type __DisonPendingEntry =\n` +
+    `  | { kind: "bind"; key: () => __DisonKey; f: __DisonFactory; seq: number }\n` +
+    `  | { kind: "override"; cls: () => Function; prop: string; f: __DisonFactory; seq: number };\n` +
+    `// One store shape shared by the global registries and every scope frame.\n` +
+    `interface __DisonStore {\n` +
+    `  binds: Map<__DisonKey, __DisonSlot>;\n` +
+    `  overrides: WeakMap<Function, Record<string, __DisonSlot>>;\n` +
+    `  pending: __DisonPendingEntry[];\n` +
+    `}\n` +
+    `interface __DisonFrame extends __DisonStore {\n` +
     `  parent: __DisonFrame | undefined;\n` +
     `}\n` +
+    `let __dison_seq = 0;\n` +
+    `function __disonPendBind(store: __DisonStore, key: () => __DisonKey, f: __DisonFactory): void {\n` +
+    `  store.pending.push({ kind: "bind", key, f, seq: __dison_seq++ });\n` +
+    `}\n` +
+    `function __disonPendOverride(store: __DisonStore, cls: () => Function, prop: string, f: __DisonFactory): void {\n` +
+    `  store.pending.push({ kind: "override", cls, prop, f, seq: __dison_seq++ });\n` +
+    `}\n` +
+    `// Drain a store's queue. Entries whose key thunk still hits the TDZ are kept and\n` +
+    `// retried later; everything else is applied, newest-seq-wins per key.\n` +
+    `function __disonApplyPending(store: __DisonStore): void {\n` +
+    `  if (store.pending.length === 0) return;\n` +
+    `  const remaining: __DisonPendingEntry[] = [];\n` +
+    `  for (const e of store.pending) {\n` +
+    `    let key: any;\n` +
+    `    try {\n` +
+    `      key = e.kind === "bind" ? e.key() : e.cls();\n` +
+    `    } catch (err) {\n` +
+    `      if (err instanceof ReferenceError) { remaining.push(e); continue; }\n` +
+    `      throw err;\n` +
+    `    }\n` +
+    `    if (e.kind === "bind") {\n` +
+    `      const cur = store.binds.get(key);\n` +
+    `      if (cur === undefined || cur.seq < e.seq) store.binds.set(key, { f: e.f, seq: e.seq });\n` +
+    `    } else {\n` +
+    `      let rec = store.overrides.get(key);\n` +
+    `      if (rec === undefined) { rec = {}; store.overrides.set(key, rec); }\n` +
+    `      const cur = rec[e.prop];\n` +
+    `      if (cur === undefined || cur.seq < e.seq) rec[e.prop] = { f: e.f, seq: e.seq };\n` +
+    `    }\n` +
+    `  }\n` +
+    `  store.pending = remaining;\n` +
+    `}\n\n` +
+    `// --- scope infrastructure (docs/scoped-configuration.md) ---\n` +
     `${E}const __dison_als = new AsyncLocalStorage<__DisonFrame | undefined>();\n` +
     `// Current scope frame (undefined = global only). Captured by injectable at construction.\n` +
     `${E}function __disonCurrentScope(): __DisonFrame | undefined { return __dison_als.getStore(); }\n\n` +
@@ -59,29 +114,56 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `  }\n` +
     `  return out;\n` +
     `}\n` +
+    `function __disonNewFrame(parent: __DisonFrame | undefined): __DisonFrame {\n` +
+    `  return { binds: new Map(), overrides: new WeakMap(), pending: [], parent };\n` +
+    `}\n` +
     `// Build a frame without entering it (used to initialize a class body static field).\n` +
+    `// The setup callback receives key THUNKS, so a class-body configuration may reference\n` +
+    `// classes declared later in the file (evaluated at the first lookup on the frame).\n` +
+    `${E}function __disonBuildFrameLazy(\n` +
+    `  setup: (bind: (key: () => __DisonKey, factory: __DisonFactory) => void, override: (cls: () => Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): __DisonFrame {\n` +
+    `  const frame = __disonNewFrame(undefined);\n` +
+    `  setup(\n` +
+    `    (key, factory) => { __disonPendBind(frame, key, factory); },\n` +
+    `    (cls, prop, factory) => { __disonPendOverride(frame, cls, prop, factory); }\n` +
+    `  );\n` +
+    `  return frame;\n` +
+    `}\n` +
+    `// Backward-compatible variant taking eager key values (generated by older CLI versions).\n` +
     `${E}function __disonBuildFrame(\n` +
     `  setup: (bind: (key: __DisonKey, factory: __DisonFactory) => void, override: (cls: Function, prop: string, factory: __DisonFactory) => void) => void\n` +
     `): __DisonFrame {\n` +
-    `  const frame: __DisonFrame = { binds: new Map(), overrides: new WeakMap(), parent: undefined };\n` +
+    `  const frame = __disonNewFrame(undefined);\n` +
     `  setup(\n` +
-    `    (key, factory) => { frame.binds.set(key, factory); },\n` +
-    `    (cls, prop, factory) => {\n` +
-    `      let e = frame.overrides.get(cls);\n` +
-    `      if (!e) { e = {}; frame.overrides.set(cls, e); }\n` +
-    `      e[prop] = factory;\n` +
-    `    }\n` +
+    `    (key, factory) => { __disonPendBind(frame, () => key, factory); },\n` +
+    `    (cls, prop, factory) => { __disonPendOverride(frame, () => cls, prop, factory); }\n` +
     `  );\n` +
     `  return frame;\n` +
     `}\n\n` +
     `// --- global registries ---\n` +
     `// Global dependency registry (per-property override). Keyed by the class itself\n` +
     `// so tsc catches a typo in the override target class name.\n` +
-    `${E}const DI_REGISTRY = new WeakMap<Function, Record<string, __DisonFactory>>();\n\n` +
+    `${E}const DI_REGISTRY = new WeakMap<Function, Record<string, __DisonSlot>>();\n` +
+    `// Global type-replacement registry (bind). Key: class value (concrete class),\n` +
+    `// companion/token Symbol, or type-name string. See docs/type-identity-matching.md.\n` +
+    `${E}const TYPE_BINDINGS = new Map<__DisonKey, __DisonSlot>();\n` +
+    `const __DISON_GLOBAL: __DisonStore = { binds: TYPE_BINDINGS, overrides: DI_REGISTRY, pending: [] };\n\n` +
+    `// The Lazy variants take the key as a thunk (forward-reference safe); the plain\n` +
+    `// variants keep the old eager-key signature for code generated by older CLI versions.\n` +
+    `// bindTypeLazy<T> takes T as an explicit type argument, so tsc raises a compile error\n` +
+    `// if the replacement factory isn't compatible with the original type.\n` +
+    `${E}function bindTypeLazy<T>(key: () => __DisonKey, factory: () => T): void {\n` +
+    `  __disonPendBind(__DISON_GLOBAL, key, factory);\n` +
+    `}\n` +
+    `${E}function bindType<T>(typeKey: __DisonKey, factory: () => T): void {\n` +
+    `  __disonPendBind(__DISON_GLOBAL, () => typeKey, factory);\n` +
+    `}\n` +
+    `${E}function registerOverrideLazy(cls: () => Function, prop: string, factory: __DisonFactory): void {\n` +
+    `  __disonPendOverride(__DISON_GLOBAL, cls, prop, factory);\n` +
+    `}\n` +
     `${E}function registerOverride(cls: Function, prop: string, factory: __DisonFactory): void {\n` +
-    `  let entry = DI_REGISTRY.get(cls);\n` +
-    `  if (!entry) { entry = {}; DI_REGISTRY.set(cls, entry); }\n` +
-    `  entry[prop] = factory;\n` +
+    `  __disonPendOverride(__DISON_GLOBAL, () => cls, prop, factory);\n` +
     `}\n\n` +
     `// Override target matching walks the prototype chain of the receiver's class\n` +
     `// (child -> parent, child-wins): an override targeting a base class applies to\n` +
@@ -95,53 +177,52 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `}\n` +
     `// Match one override table against the class chain (child-wins).\n` +
     `function __disonChainLookup(\n` +
-    `  map: { get(k: Function): Record<string, __DisonFactory> | undefined },\n` +
+    `  map: { get(k: Function): Record<string, __DisonSlot> | undefined },\n` +
     `  chain: Function[], prop: string\n` +
     `): __DisonFactory | undefined {\n` +
     `  for (const c of chain) {\n` +
     `    const o = map.get(c);\n` +
-    `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop];\n` +
+    `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop].f;\n` +
     `  }\n` +
     `  return undefined;\n` +
     `}\n` +
     `// Look up an override in order: local frame chain (inner->outer) -> class scopes\n` +
     `// (child->parent) -> global (priority: local > class > global). Scope-major: each\n` +
     `// layer checks the whole class chain, so a nearer scope targeting a base class\n` +
-    `// beats a farther scope targeting the subclass.\n` +
+    `// beats a farther scope targeting the subclass. Each store drains its queue first.\n` +
     `${E}function getOverride(cls: Function, prop: string): __DisonFactory | undefined {\n` +
     `  const chain = __disonClassChain(cls);\n` +
     `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
+    `    __disonApplyPending(f);\n` +
     `    const hit = __disonChainLookup(f.overrides, chain, prop);\n` +
     `    if (hit) return hit;\n` +
     `  }\n` +
     `  if (__dison_classScopeCtx) for (const f of __dison_classScopeCtx) {\n` +
+    `    __disonApplyPending(f);\n` +
     `    const hit = __disonChainLookup(f.overrides, chain, prop);\n` +
     `    if (hit) return hit;\n` +
     `  }\n` +
+    `  __disonApplyPending(__DISON_GLOBAL);\n` +
     `  return __disonChainLookup(DI_REGISTRY, chain, prop);\n` +
     `}\n\n` +
-    `// Global type-replacement registry (bind). Key: class value (concrete class),\n` +
-    `// companion/token Symbol, or type-name string. See docs/type-identity-matching.md.\n` +
-    `${E}const TYPE_BINDINGS = new Map<__DisonKey, __DisonFactory>();\n` +
     `const _resolvingTypeBindings = new Set<__DisonKey>();\n\n` +
-    `// bindType<T> takes T as an explicit type argument, so tsc raises a compile error\n` +
-    `// if the replacement factory isn't compatible with the original type.\n` +
-    `${E}function bindType<T>(typeKey: __DisonKey, factory: () => T): void {\n` +
-    `  TYPE_BINDINGS.set(typeKey, factory);\n` +
-    `}\n\n` +
     `// Look up a bind in order: local frame chain (inner->outer) -> class scopes (child->parent)\n` +
     `// -> global. __dison_classScopeCtx stays set throughout a resolution, so a bind chain inside\n` +
     `// a class scope (the recursion in resolveType) follows the class scope too.\n` +
+    `// Each store drains its queue first.\n` +
     `function __disonLookupBind(typeKey: __DisonKey): __DisonFactory | undefined {\n` +
     `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
+    `    __disonApplyPending(f);\n` +
     `    const b = f.binds.get(typeKey);\n` +
-    `    if (b) return b;\n` +
+    `    if (b) return b.f;\n` +
     `  }\n` +
     `  if (__dison_classScopeCtx) for (const f of __dison_classScopeCtx) {\n` +
+    `    __disonApplyPending(f);\n` +
     `    const b = f.binds.get(typeKey);\n` +
-    `    if (b) return b;\n` +
+    `    if (b) return b.f;\n` +
     `  }\n` +
-    `  return TYPE_BINDINGS.get(typeKey);\n` +
+    `  __disonApplyPending(__DISON_GLOBAL);\n` +
+    `  return TYPE_BINDINGS.get(typeKey)?.f;\n` +
     `}\n\n` +
     `// Scope-aware bind resolution. bind chains (bind A = B; bind B = C; resolves A to C).\n` +
     `// Each hop of the chain also consults the current frame chain -> class -> global.\n` +
@@ -180,21 +261,32 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `// current frame, populate its bind/override via setup, and enter it (enterWith). The return\n` +
     `// value has Symbol.dispose, so a \`using\` declaration restores the previous frame at the end\n` +
     `// of the enclosing block. setup uses the bind/override helpers to add the deltas.\n` +
-    `${E}function __disonEnterScope(\n` +
-    `  setup: (bind: (key: __DisonKey, factory: __DisonFactory) => void, override: (cls: Function, prop: string, factory: __DisonFactory) => void) => void\n` +
-    `): { [Symbol.dispose](): void } {\n` +
-    `  const frame: __DisonFrame = { binds: new Map(), overrides: new WeakMap(), parent: __dison_als.getStore() };\n` +
-    `  setup(\n` +
-    `    (key, factory) => { frame.binds.set(key, factory); },\n` +
-    `    (cls, prop, factory) => {\n` +
-    `      let e = frame.overrides.get(cls);\n` +
-    `      if (!e) { e = {}; frame.overrides.set(cls, e); }\n` +
-    `      e[prop] = factory;\n` +
-    `    }\n` +
-    `  );\n` +
+    `function __disonEnterFrame(frame: __DisonFrame): { [Symbol.dispose](): void } {\n` +
     `  const prev = __dison_als.getStore();\n` +
     `  __dison_als.enterWith(frame);\n` +
     `  return { [Symbol.dispose]() { __dison_als.enterWith(prev); } };\n` +
+    `}\n` +
+    `// The setup callback receives key THUNKS (forward-reference safe within the block).\n` +
+    `${E}function __disonEnterScopeLazy(\n` +
+    `  setup: (bind: (key: () => __DisonKey, factory: __DisonFactory) => void, override: (cls: () => Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): { [Symbol.dispose](): void } {\n` +
+    `  const frame = __disonNewFrame(__dison_als.getStore());\n` +
+    `  setup(\n` +
+    `    (key, factory) => { __disonPendBind(frame, key, factory); },\n` +
+    `    (cls, prop, factory) => { __disonPendOverride(frame, cls, prop, factory); }\n` +
+    `  );\n` +
+    `  return __disonEnterFrame(frame);\n` +
+    `}\n` +
+    `// Backward-compatible variant taking eager key values (generated by older CLI versions).\n` +
+    `${E}function __disonEnterScope(\n` +
+    `  setup: (bind: (key: __DisonKey, factory: __DisonFactory) => void, override: (cls: Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): { [Symbol.dispose](): void } {\n` +
+    `  const frame = __disonNewFrame(__dison_als.getStore());\n` +
+    `  setup(\n` +
+    `    (key, factory) => { __disonPendBind(frame, () => key, factory); },\n` +
+    `    (cls, prop, factory) => { __disonPendOverride(frame, () => cls, prop, factory); }\n` +
+    `  );\n` +
+    `  return __disonEnterFrame(frame);\n` +
     `}\n`
   );
 }
