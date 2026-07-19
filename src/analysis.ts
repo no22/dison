@@ -403,22 +403,175 @@ export function isRiskyInjectableType(typeKey: string, typeKinds: DeclaredTypeKi
 // `class`（直後が ':'）だけは誤検出しないよう明示的に除外している
 // （`obj.class = ...` のようなメンバアクセスの誤検出までは対応していない。
 // 他のヒューリスティック（collectDeclaredTypeKinds等）と同様の既知の限界）。
+// その位置を直接囲んでいる関数の種別。ローカルconfigurationのasync対応
+// （docs/async-local-scope.md）で使う: async関数内では脱糖形に暗黙のサスペンション
+// （await null）を挿入し、ジェネレータ内ではエラーにする。制御ブロック
+// （if/for/while/switch/catch等）や単なるブロックは囲み関数の種別を継承する。
+export type EnclosingFunctionKind = "none" | "sync" | "async" | "generator" | "async-generator";
+
 export interface BlockContext {
   isTopLevel(idx: number): boolean;
   isDirectClassBodyChild(idx: number): boolean;
+  enclosingFunctionKind(idx: number): EnclosingFunctionKind;
 }
 
 export function collectBlockContext(tokens: Token[]): BlockContext {
   const depthAt: number[] = new Array(tokens.length);
   const isClassBodyAt: boolean[] = new Array(tokens.length);
+  const funcKindAt: EnclosingFunctionKind[] = new Array(tokens.length);
 
   const blockStack: boolean[] = []; // 各要素: そのブロックがクラス本体ならtrue
+  // 各ブロック内で有効な「直近の囲み関数の種別」。関数本体の "{" で新しい種別を
+  // 積み、それ以外のブロックは外側の種別を継承する。
+  const funcStack: EnclosingFunctionKind[] = [];
   let sawClassKeyword = false;
+
+  // --- "{"の直前トークン列から、そのブロックが関数本体かどうかを判定するヘルパ群 ---
+  // トークンレベルのヒューリスティック（class本体判定と同水準）。既知の限界:
+  // 戻り値型注釈に関数型やオブジェクト型リテラルを含む場合、計算プロパティ名
+  // （[Symbol.iterator]() 等）、セミコロン省略スタイルでの「呼び出し式の直後の
+  // 裸ブロック」などは誤判定しうる（docs/async-local-scope.md §6）。
+
+  const prevSigIdx = (from: number): number => {
+    let j = from;
+    while (j >= 0 && (tokens[j].type === "whitespace" || tokens[j].type === "comment")) j--;
+    return j;
+  };
+
+  const isPunct = (i: number, text: string): boolean =>
+    i >= 0 && tokens[i].type === "punct" && tokens[i].text === text;
+  const isWord = (i: number, text: string): boolean =>
+    i >= 0 && (tokens[i].type === "ident" || tokens[i].type === "keyword") && tokens[i].text === text;
+
+  // ")" の位置から対応する "(" の位置へ正確に遡る（括弧の数を数える）。
+  const matchParenBack = (closeIdx: number): number => {
+    let depth = 0;
+    for (let j = closeIdx; j >= 0; j--) {
+      if (tokens[j].type !== "punct") continue;
+      if (tokens[j].text === ")") depth++;
+      else if (tokens[j].text === "(") {
+        depth--;
+        if (depth === 0) return j;
+      }
+    }
+    return -1;
+  };
+
+  // "{"の直前が戻り値型注釈（"): 型 {"）である場合、型部分を後方へ読み飛ばして
+  // パラメータリストの ")" の位置を返す。型注釈として現れうるトークン
+  // （識別子・文字列リテラル型・: < > | & [ ] , . ?）だけを許容し、それ以外に
+  // 当たったら関数頭部ではないと判断して -1 を返す。
+  const TYPE_PUNCTS = new Set([":", "<", ">", "|", "&", "[", "]", ",", ".", "?"]);
+  const skipReturnTypeBack = (from: number): number => {
+    let j = from;
+    while (j >= 0) {
+      j = prevSigIdx(j);
+      if (j < 0) return -1;
+      const t = tokens[j];
+      if (t.type === "punct" && t.text === ")") {
+        // ") : 型... {" の形か確認（")"の直後の有意トークンが ":"）
+        const after = nextSignificantToken(tokens, j + 1);
+        return after !== null && after.type === "punct" && after.text === ":" ? j : -1;
+      }
+      const typeish =
+        t.type === "ident" || t.type === "string" || (t.type === "punct" && TYPE_PUNCTS.has(t.text));
+      if (!typeish) return -1;
+      j--;
+    }
+    return -1;
+  };
+
+  // braceIdx の "{" が関数本体なら、その関数の種別を返す。関数本体でなければ
+  // null（呼び出し側で囲み種別を継承する）。
+  const classifyFunctionBody = (braceIdx: number): EnclosingFunctionKind | null => {
+    const p1 = prevSigIdx(braceIdx - 1);
+    if (p1 < 0) return null;
+
+    // --- アロー関数本体: "=> {"（"="と">"は1文字ずつのpunctトークン） ---
+    if (isPunct(p1, ">")) {
+      const pEq = prevSigIdx(p1 - 1);
+      if (isPunct(pEq, "=")) {
+        let q = prevSigIdx(pEq - 1);
+        // "(params): 型 => {" の戻り値型注釈を読み飛ばす
+        if (!isPunct(q, ")")) {
+          const r = skipReturnTypeBack(q);
+          if (r >= 0) q = r;
+        }
+        if (isPunct(q, ")")) {
+          const open = matchParenBack(q);
+          const h = open >= 0 ? prevSigIdx(open - 1) : -1;
+          return isWord(h, "async") ? "async" : "sync";
+        }
+        if (q >= 0 && tokens[q].type === "ident") {
+          // 単一パラメータ形式 "x => {" / "async x => {"
+          const h = prevSigIdx(q - 1);
+          return isWord(h, "async") ? "async" : "sync";
+        }
+        return "sync";
+      }
+      // ">"だが"=>"ではない（例: 戻り値型 "Promise<void> {"）→ 下の型スキップへ
+    }
+
+    // --- 関数/メソッド/制御文の本体: "( ... ) {" または "( ... ): 型 {" ---
+    let close = -1;
+    if (isPunct(p1, ")")) close = p1;
+    else close = skipReturnTypeBack(p1);
+    if (close < 0) return null; // 関数頭部ではない（オブジェクトリテラル・裸ブロック等）
+
+    const open = matchParenBack(close);
+    if (open < 0) return null;
+    const h = prevSigIdx(open - 1);
+    if (h < 0) return null;
+    const ht = tokens[h];
+
+    // 制御ブロックは関数ではない（囲み種別を継承）
+    if (
+      isWord(h, "if") || isWord(h, "for") || isWord(h, "while") ||
+      isWord(h, "switch") || isWord(h, "catch")
+    ) {
+      return null;
+    }
+    if (isWord(h, "await") && isWord(prevSigIdx(h - 1), "for")) return null; // for await ( ... )
+
+    // 無名関数式: "function () {}" / "function* () {}" / "async function () {}"
+    if (isWord(h, "function")) {
+      return isWord(prevSigIdx(h - 1), "async") ? "async" : "sync";
+    }
+    if (isPunct(h, "*")) {
+      const f = prevSigIdx(h - 1);
+      if (isWord(f, "function")) {
+        return isWord(prevSigIdx(f - 1), "async") ? "async-generator" : "generator";
+      }
+      return "generator"; // オブジェクトリテラルの "*() {}" 等
+    }
+
+    // 名前付き関数・メソッド: "name() {}" の name の手前を見る
+    if (ht.type === "ident" || ht.type === "keyword") {
+      const b = prevSigIdx(h - 1);
+      if (isWord(b, "function")) {
+        return isWord(prevSigIdx(b - 1), "async") ? "async" : "sync";
+      }
+      if (isPunct(b, "*")) {
+        const f = prevSigIdx(b - 1);
+        if (isWord(f, "function")) {
+          return isWord(prevSigIdx(f - 1), "async") ? "async-generator" : "generator";
+        }
+        return isWord(f, "async") ? "async-generator" : "generator"; // "*name() {}" メソッド
+      }
+      if (isWord(b, "async")) return "async"; // "async name() {}" メソッド
+      if (isWord(b, "get") || isWord(b, "set")) return "sync";
+      if (b >= 0 && tokens[b].type === "keyword") return null; // Dison構文の一部（念のため）
+      return "sync"; // メソッド短縮形 "name() {}" とみなす
+    }
+
+    return null;
+  };
 
   for (let idx = 0; idx < tokens.length; idx++) {
     const t = tokens[idx];
     depthAt[idx] = blockStack.length;
     isClassBodyAt[idx] = blockStack.length > 0 ? blockStack[blockStack.length - 1] : false;
+    funcKindAt[idx] = funcStack.length > 0 ? funcStack[funcStack.length - 1] : "none";
 
     if (t.type === "ident" && t.text === "class") {
       const next = nextSignificantToken(tokens, idx + 1);
@@ -427,15 +580,25 @@ export function collectBlockContext(tokens: Token[]): BlockContext {
         sawClassKeyword = true;
       }
     } else if (t.type === "punct" && t.text === "{") {
-      blockStack.push(sawClassKeyword);
+      const isClassBody = sawClassKeyword;
+      blockStack.push(isClassBody);
+      if (isClassBody) {
+        // クラス本体自体は関数ではない（メソッド本体は各自の頭部で再分類される）
+        funcStack.push("none");
+      } else {
+        const kind = classifyFunctionBody(idx);
+        funcStack.push(kind ?? (funcStack.length > 0 ? funcStack[funcStack.length - 1] : "none"));
+      }
       sawClassKeyword = false;
     } else if (t.type === "punct" && t.text === "}") {
       blockStack.pop();
+      funcStack.pop();
     }
   }
 
   return {
     isTopLevel: (idx) => (depthAt[idx] ?? 0) === 0,
     isDirectClassBodyChild: (idx) => isClassBodyAt[idx] ?? false,
+    enclosingFunctionKind: (idx) => funcKindAt[idx] ?? "none",
   };
 }

@@ -140,10 +140,15 @@ function generateConfiguration(
   if (node.scope === "local") {
     // 無名ローカル configuration。__disonEnterScope の setup で __disonBind/__disonOverride を
     // 使ってフレームへ差分を積む。`using` で受けるのでブロック終端で自動的に戻る。
-    return (
-      `using __dison_scope_${scopeId} = __disonEnterScope((__disonBind, __disonOverride) => {\n` +
-      `${lines.join("\n")}\n});`
-    );
+    // async関数内では (await null, ...) で一度中断してから enterWith することで、
+    // スコープを関数専有のマイクロタスク実行に隔離し呼び出し元への漏れを防ぐ
+    // （暗黙のサスペンションポイント。docs/async-local-scope.md §2）。
+    const enter =
+      `__disonEnterScope((__disonBind, __disonOverride) => {\n` +
+      `${lines.join("\n")}\n})`;
+    return node.asyncScope === true
+      ? `using __dison_scope_${scopeId} = (await null, ${enter});`
+      : `using __dison_scope_${scopeId} = ${enter};`;
   }
   if (node.scope === "class") {
     // 無名クラス configuration。クラス本体の static フィールドとしてフレームを構築する。

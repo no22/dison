@@ -42,7 +42,10 @@ export type Node =
   //     に脱糖されレキシカルなスコープに閉じる。
   //   - "class": クラス本体直下。無名のみ（フェーズ2）で、`static __dison_classScope_N =
   //     __disonBuildFrame(...)` に脱糖され、そのクラスのインスタンスの解決に効く。
-  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; entries: ConfigEntry[] }
+  // asyncScope: scope==="local" で囲み関数がasyncの場合true。脱糖形に暗黙の
+  // サスペンション（await null）を挿入して呼び出し元への漏れを防ぐ
+  // （docs/async-local-scope.md）。
+  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[] }
   // token: "injectable prop: Type as Token = ...;" のas句（bindと同じ役割）。
   | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string }
   // token Name; -> export const Name = Symbol("Name"); に脱糖される

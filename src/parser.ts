@@ -501,6 +501,26 @@ export class Parser {
       ? "class"
       : "local";
 
+    // ローカルスコープと非同期実行の相互作用（docs/async-local-scope.md）:
+    //   - ジェネレータ（sync/async）本体ではスコープをyieldをまたいで維持できない
+    //     ためエラー（syncは呼び出し元へ漏れ、asyncは最初のyield後に静かに失われる）。
+    //   - async関数本体では脱糖形に暗黙のサスペンション（await null）を挿入して
+    //     enterWithを関数専有のコンテキストに隔離する（asyncScopeフラグ）。
+    let asyncScope = false;
+    if (scope === "local") {
+      const fnKind = this.blockContext.enclosingFunctionKind(configPos);
+      if (fnKind === "generator" || fnKind === "async-generator") {
+        throw new DisonParseError(
+          `A local "configuration" cannot be used inside a ${
+            fnKind === "generator" ? "generator" : "async generator"
+          } function body (the scope cannot be kept across "yield"). ` +
+            `Move the configuration into the function that drives the generator instead.`,
+          this.peek().pos
+        );
+      }
+      asyncScope = fnKind === "async";
+    }
+
     const startTok = this.next(); // 'configuration'
     this.skipTrivia();
     // 名前は任意。無名（次が "{"）なら auto-active。
@@ -546,7 +566,7 @@ export class Parser {
       );
     }
 
-    return { kind: "configuration", name, scope, entries };
+    return { kind: "configuration", name, scope, asyncScope, entries };
   }
 
   // context: エラーメッセージに埋め込む文脈の説明。configuration内で呼ばれる
