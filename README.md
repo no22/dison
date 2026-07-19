@@ -93,8 +93,8 @@ class UserService {
 
 ### `configuration` / `activate`
 
-Groups a set of `override`/`bind` statements and activates them
-explicitly:
+Groups a set of `override`/`bind` statements. A **named** configuration
+is activated explicitly with `activate`:
 
 ```dison
 configuration TestConfig {
@@ -104,12 +104,52 @@ configuration TestConfig {
 activate TestConfig;
 ```
 
-`configuration` must be written at the top level. To activate a
-configuration defined in another file:
+To activate a configuration defined in another file:
 
 ```dison
 activate TestConfig from "./configs";
 ```
+
+#### Scoped configuration (new in 1.2.0)
+
+Where you write a `configuration` decides how far it reaches. An
+**anonymous** `configuration { ... }` is auto-active (no `activate`
+needed) for the place it's written:
+
+- **Top level** → global, as before.
+- **Inside a function/method body** → a **local scope**, lexically
+  limited to the rest of that block. Great for per-test or per-request
+  isolation — the wiring is undone automatically when the block ends,
+  and concurrent async requests don't interfere.
+- **Directly inside a class body** → a **class scope**: that class's
+  declarative DI wiring, shared by all its instances and inherited by
+  subclasses (which can override just the parts they change).
+
+```dison
+class UserService {
+  injectable repo: IUserRepository = new SqlUserRepository();
+  configuration { bind IUserRepository = CachedUserRepository; }  // class scope
+}
+
+function underTest(): void {
+  configuration { bind IUserRepository = MockUserRepository; }    // local scope
+  new UserService().repo.findById("1");   // uses the Mock here...
+}
+// ...and the real (or class-scoped) wiring everywhere else.
+```
+
+Resolution priority is **local > class > global > default initializer**.
+A dependency is wired according to the scope active where its *root*
+object was constructed, and the whole lazily-built object graph follows
+that same scope consistently.
+
+> Local scopes desugar to `using` + `AsyncLocalStorage`, so generated
+> code that uses them needs `Symbol.dispose` (TypeScript 5.2+ / Node 20+)
+> and `node:async_hooks` at runtime. See [Requirements](#requirements).
+
+*(Named local/class configurations, and activating them by name, aren't
+supported yet — use an anonymous `configuration { ... }` for local and
+class scopes.)*
 
 ### `override`
 
@@ -145,6 +185,16 @@ bind SqlUserRepository = MockUserRepository;
 `bind` supports generics on both sides (`bind Repository<User> = MockRepository;`)
 and can be written standalone or inside a `configuration`, same as
 `override`.
+
+The replacement can take **constructor arguments** (new in 1.2.0), so
+you can bind types whose constructor needs values:
+
+```dison
+bind Repository = PostgresRepository("postgres://localhost/db");
+```
+
+The arguments are type-checked against the replacement's constructor,
+and a standalone `bind`'s arguments can capture local variables.
 
 ### `token`
 
@@ -207,6 +257,23 @@ export, so an `override`/`bind` activated in one file is visible from
 classes defined in another — as long as they all resolve
 `@no22/dison/runtime` to the same installed copy (in practice: they're part of the same project
 and share a common `node_modules` ancestor, which is the normal case).
+
+## Requirements
+
+The generated code targets a modern TypeScript/Node toolchain:
+
+- **TypeScript 5.2+** and **Node.js 20+** if you use **local scopes**
+  (an anonymous `configuration` inside a function/method body). Those
+  desugar to `using` + `AsyncLocalStorage`, which need `Symbol.dispose`
+  and `node:async_hooks`. Your `tsconfig.json` needs a `lib` that
+  includes `Symbol.dispose` (e.g. `"lib": ["esnext"]`) and
+  `@types/node`.
+- Everything else (`injectable`/`override`/`bind`, global and class
+  scopes) has no special requirement beyond a current TypeScript.
+
+The runtime module (`@no22/dison/runtime`) is shipped pre-compiled, so
+these requirements apply to *your generated `.ts` files*, not to the
+package itself.
 
 ## Samples
 
