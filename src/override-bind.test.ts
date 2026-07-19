@@ -32,8 +32,8 @@ configuration Cfg {
   });
 });
 
-describe("bind: 非ジェネリクス（後方互換）", () => {
-  it("bindType<Original>(\"Original\", ...) が生成される", () => {
+describe("bind: 具象クラスは実体参照キー（docs/type-identity-matching.md 案A(a)）", () => {
+  it("具象クラスの左辺・差し替え先はクラスの実体をキーにする（文字列リテラルにしない）", () => {
     const out = transpileDisonToTS(`
 class Real {}
 class Mock {}
@@ -41,7 +41,59 @@ configuration Cfg {
   bind Real = Mock;
 }
 `);
-    expect(out).toContain('bindType<Real>("Real", () => resolveType("Mock", () => new Mock()));');
+    // Real / Mock はどちらも具象クラスなので、"Real"/"Mock" ではなくクラスの
+    // 実体参照そのものがキーになる。これにより複数ファイルで同名クラスが
+    // 衝突しなくなる（手動tokenが不要）。
+    expect(out).toContain('bindType<Real>(Real, () => resolveType(Mock, () => new Mock()));');
+  });
+
+  it("injectableの具象クラス型も実体参照キーになり、bindの左辺と一致する", () => {
+    const out = transpileDisonToTS(`
+class Real {}
+class Mock {}
+class S { injectable dep: Real; }
+configuration Cfg { bind Real = Mock; }
+`);
+    // injectable側 resolveType のキーも bind側 bindType のキーも同じ実体 Real。
+    expect(out).toContain("resolveType(Real, () => new Real())");
+    expect(out).toContain("bindType<Real>(Real,");
+  });
+
+  it("interface/型エイリアスは companion Symbol でキー化される（案A(b)）", () => {
+    const out = transpileDisonToTS(`
+interface IRepo {}
+class Impl implements IRepo {}
+configuration Cfg { bind IRepo = Impl; }
+`);
+    // 左辺 IRepo は interface なので companion Symbol（宣言に対し自動生成）をキーに、
+    // 差し替え先 Impl は具象クラスなので実体キー。DI利用されるので companion が emit される。
+    expect(out).toContain('export const __dison_token_IRepo = Symbol("IRepo");');
+    expect(out).toContain('bindType<IRepo>(__dison_token_IRepo, () => resolveType(Impl, () => new Impl()));');
+  });
+
+  it("abstract class は実行時に値を持つので companion ではなく実体参照キーになる", () => {
+    const out = transpileDisonToTS(`
+abstract class Repo { abstract who(): string; }
+class Real extends Repo { who() { return "r"; } }
+class Mock extends Repo { who() { return "m"; } }
+class S { injectable dep: Repo = new Real(); }
+configuration Cfg { bind Repo = Mock; }
+`);
+    // abstract class は new 不可だが値を持つため実体キー（companion は生成しない）。
+    expect(out).not.toContain("__dison_token_Repo");
+    expect(out).toContain("resolveType(Repo, () => (new Real()))");
+    expect(out).toContain("bindType<Repo>(Repo, () => resolveType(Mock, () => new Mock()));");
+  });
+
+  it("DI利用されないローカルinterfaceには companion を emit しない（案2: DI利用のみ）", () => {
+    const out = transpileDisonToTS(`
+interface IUsed {}
+interface IUnused { x: number; }
+class Impl implements IUsed {}
+class S { injectable dep: IUsed = new Impl(); }
+`);
+    expect(out).toContain("__dison_token_IUsed");
+    expect(out).not.toContain("__dison_token_IUnused");
   });
 });
 
@@ -125,7 +177,7 @@ class Base { name = "default"; }
 class Mock extends Base { name = "mock"; }
 bind Base = Mock;
 `);
-    expect(out).toContain('bindType<Base>("Base", () => resolveType("Mock", () => new Mock()));');
+    expect(out).toContain('bindType<Base>(Base, () => resolveType(Mock, () => new Mock()));');
     expect(out).not.toContain("function activate");
   });
 

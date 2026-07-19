@@ -178,6 +178,104 @@ export function collectImportOrigins(tokens: Token[]): Map<string, string> {
   return origins;
 }
 
+// 複数ファイルの実体キー一致（docs/type-identity-matching.md 案A(a)）で使う。
+// collectImportOrigins より詳しい情報を返す import スキャナ。各 named import に
+// ついて「このファイルで使えるローカル名」「相手ファイルでの元のexport名」
+// 「import specifier」「型onlyインポートか」を収集する。value-importされた
+// 具象クラスを実体キー化の対象に含めるかどうかの判定に使う。
+//
+// collectImportOrigins（衝突検出用、localName->specifier のみ）とは別関数として
+// 追加している（既存の呼び出し側の挙動を変えないため）。
+// `import type { X } from "spec"` は typeOnly=true として、`import { type X, Y }` の
+// X のような inline type modifier も個別に typeOnly=true として記録する
+// （型onlyなインポートは実行時に値を持たないため、実体参照キーには使えない）。
+export interface ImportBinding {
+  localName: string;
+  importedName: string;
+  specifier: string;
+  typeOnly: boolean;
+}
+
+export function collectImportBindings(tokens: Token[]): ImportBinding[] {
+  const bindings: ImportBinding[] = [];
+
+  for (let idx = 0; idx < tokens.length; idx++) {
+    const t = tokens[idx];
+    if (t.type !== "ident" || t.text !== "import") continue;
+
+    // "import" の直後が "type" なら、この import 全体が型onlyインポート。
+    const afterImport = nextSignificantToken(tokens, idx + 1);
+    const wholeTypeOnly = afterImport !== null && afterImport.type === "ident" && afterImport.text === "type";
+
+    let j = idx + 1;
+    while (j < tokens.length && !(tokens[j].type === "punct" && (tokens[j].text === "{" || tokens[j].text === ";"))) {
+      j++;
+    }
+    if (!(j < tokens.length && tokens[j].type === "punct" && tokens[j].text === "{")) continue;
+
+    let depth = 1;
+    j++;
+    const specStart = j;
+    while (j < tokens.length && depth > 0) {
+      if (tokens[j].type === "punct" && tokens[j].text === "{") depth++;
+      else if (tokens[j].type === "punct" && tokens[j].text === "}") depth--;
+      if (depth > 0) j++;
+    }
+    const braceEnd = j; // '}' のインデックス
+
+    let k = braceEnd + 1;
+    while (k < tokens.length && (tokens[k].type === "whitespace" || tokens[k].type === "comment")) k++;
+    if (!(k < tokens.length && tokens[k].type === "ident" && tokens[k].text === "from")) continue;
+    k++;
+    while (k < tokens.length && (tokens[k].type === "whitespace" || tokens[k].type === "comment")) k++;
+    if (!(k < tokens.length && tokens[k].type === "string")) continue;
+    const specifier = parseStringLiteralValue(tokens[k].text);
+
+    // specStart..braceEnd の中の "(type)? IDENT (as IDENT)?" をカンマ区切りで読む。
+    let p = specStart;
+    let importedName: string | null = null;
+    let alias: string | null = null;
+    let inlineTypeOnly = false;
+    let sawAs = false;
+    const flush = () => {
+      if (importedName !== null) {
+        bindings.push({
+          localName: alias ?? importedName,
+          importedName,
+          specifier,
+          typeOnly: wholeTypeOnly || inlineTypeOnly,
+        });
+      }
+      importedName = null;
+      alias = null;
+      inlineTypeOnly = false;
+      sawAs = false;
+    };
+    while (p < braceEnd) {
+      const specTok = tokens[p];
+      if (specTok.type === "whitespace" || specTok.type === "comment") {
+        p++;
+        continue;
+      }
+      if (specTok.type === "punct" && specTok.text === ",") {
+        flush();
+      } else if (specTok.type === "ident" && specTok.text === "as") {
+        sawAs = true;
+      } else if (specTok.type === "ident" && specTok.text === "type" && importedName === null) {
+        // 名前より前に現れる "type" は inline type modifier（import { type X }）。
+        inlineTypeOnly = true;
+      } else if (specTok.type === "ident") {
+        if (sawAs) alias = specTok.text;
+        else if (importedName === null) importedName = specTok.text;
+      }
+      p++;
+    }
+    flush();
+  }
+
+  return bindings;
+}
+
 // `injectable` の型注釈が「new で自動生成できない型」（interface/型エイリアス/
 // abstract class）かどうかを判定するための簡易ヒューリスティック。`class` /
 // `interface` / `type` / `abstract` はDisonの予約語ではなく普通のTSキーワード
@@ -193,12 +291,19 @@ export function collectImportOrigins(tokens: Token[]): Map<string, string> {
 //  docs/static-injectable-detection.md 参照）
 export interface DeclaredTypeKinds {
   classNames: Set<string>;
-  nonNewableTypeNames: Set<string>; // interface / type エイリアス / abstract class
+  nonNewableTypeNames: Set<string>; // interface / type エイリアス / abstract class（new 不可）
+  // nonNewableTypeNames のうち abstract class のもの。abstract class は new 不可だが
+  // 実行時に値（クラス）を持つため、bind/injectable の照合キーとしてはクラスの実体を
+  // そのまま使える（実体キー化。docs/type-identity-matching.md 案A(a)）。真の
+  // interface/型エイリアス（実行時に値が無く companion Symbol でキー化するもの。
+  // 案A(b)）と区別するために保持する。
+  abstractClassNames: Set<string>;
 }
 
 export function collectDeclaredTypeKinds(tokens: Token[]): DeclaredTypeKinds {
   const classNames = new Set<string>();
   const nonNewableTypeNames = new Set<string>();
+  const abstractClassNames = new Set<string>();
 
   for (let idx = 0; idx < tokens.length; idx++) {
     const t = tokens[idx];
@@ -211,10 +316,12 @@ export function collectDeclaredTypeKinds(tokens: Token[]): DeclaredTypeKinds {
       const prevTok = prevSignificantToken(tokens, idx - 1);
       const isAbstract = prevTok !== null && prevTok.type === "ident" && prevTok.text === "abstract";
       if (isAbstract) {
-        // abstract class は new 不可能なので、interface/type と同じ扱いにする
-        // （classNames には入れない。同名の非abstract classが別途あれば
-        // 宣言マージとみなし、下の nonNewableTypeNames 側の判定で除外される）
+        // abstract class は new 不可能なので nonNewableTypeNames に入れる（injectable の
+        // 既定初期化式必須判定＝isRiskyInjectableType のため）。ただし実行時には値を
+        // 持つので、companion ではなく実体キー化の対象として abstractClassNames にも
+        // 記録する（同名の非abstract classが別途あれば宣言マージ扱い）。
         nonNewableTypeNames.add(nameTok.text);
+        abstractClassNames.add(nameTok.text);
       } else {
         classNames.add(nameTok.text);
       }
@@ -224,7 +331,24 @@ export function collectDeclaredTypeKinds(tokens: Token[]): DeclaredTypeKinds {
     }
   }
 
-  return { classNames, nonNewableTypeNames };
+  return { classNames, nonNewableTypeNames, abstractClassNames };
+}
+
+// 実行時に値を持たない「真の interface / 型エイリアス」の名前集合を返す
+// （nonNewableTypeNames から abstract class を除いたもの）。companion Symbol で
+// キー化する対象（docs/type-identity-matching.md 案A(b)）。
+export function trueInterfaceOrAliasNames(kinds: DeclaredTypeKinds): Set<string> {
+  const result = new Set<string>();
+  for (const name of kinds.nonNewableTypeNames) {
+    if (!kinds.abstractClassNames.has(name)) result.add(name);
+  }
+  return result;
+}
+
+// bind/injectable の照合キーに実体参照（クラスの値）を使える名前集合を返す
+// （具象クラス ∪ abstract class。どちらも実行時に値を持つ）。
+export function identityKeyableClassNames(kinds: DeclaredTypeKinds): Set<string> {
+  return new Set<string>([...kinds.classNames, ...kinds.abstractClassNames]);
 }
 
 // 型注釈が「単純な型参照（＋ジェネリクス）」の形かどうかを判定する。

@@ -178,13 +178,34 @@
  *   単独のoverride/bindは、`configuration`同様クラス本体の直下だけは
  *   書けない（代入文を置ける位置ではないため）。
  *
+ * bind/injectableの照合キー（型の種別で決まる）:
+ *   `bind`/`injectable`の照合キーは型の種別で決まる（docs/type-identity-matching.md
+ *   案A、codegenのkeyExprFor）:
+ *     - 実行時に値を持つクラス（具象 or abstract）→ クラスの実体（Function）。案A(a)。
+ *     - 真の interface/型エイリアス（実行時に値が無い）→ 宣言ごとに自動生成した
+ *       companion Symbol（__dison_token_<型名>）。案A(b)。
+ *     - 外部パッケージ由来の型、または具体的な型引数を持つジェネリクス
+ *       （Repository<User>）→ 正規化済みの型名文字列（typeKey）。
+ *     - "as <トークン>"句があればそのトークン参照が最優先（利用者の明示上書き）。
+ *   クラスの実体キー化は`override`の`DI_REGISTRY`（WeakMap<Function>）と同じ発想。
+ *   クラス値・companion Symbol いずれも「複数ファイルにまたがる同名の型が別の実体
+ *   として自動的に区別され、手動tokenなしで衝突しなくなる」のが狙い。複数ファイル
+ *   モードでは、宣言側とimport側でキーが食い違わないよう、CLIが他ファイルから
+ *   importされたクラス（実体キー）・interface/型エイリアス（companion）を解決して
+ *   各ファイルの transpile に渡す（computeIdentityKeyClassesByFile／
+ *   computeCompanionPlanByFile）。companion は DI利用されるものだけ emit し、他ファイル
+ *   の型を使う側にはその companion の import を注入する（案A(c)）。
+ *
  * bindのinterface/型エイリアス問題への対応（"as <トークン>" / token）:
- *   `bind`/`injectable`の照合キーは通常、型名の文字列（typeKey）を使う。
- *   単一ファイルでは問題にならないが、複数ファイルで共有ランタイム
- *   モジュールを使う場合（docs/multi-file-support.md）、互いに無関係な
- *   2ファイルがたまたま同名のinterfaceを独自に宣言しているだけで、
- *   一方の`bind`がもう一方を汚染してしまう（実際に再現・実証済み。
- *   docs/bind-interface-token.md 1節）。
+ *   プロジェクト内で宣言される interface/型エイリアスは上記 companion で自動的に
+ *   衝突回避されるが、**外部パッケージ由来**の interface/型エイリアスは、そのパッケージが
+ *   companion をexportしていないため自動配線できず、文字列キーのままになる。単一
+ *   ファイルでは問題にならないが、複数ファイルで共有ランタイムモジュールを使う場合
+ *   （docs/multi-file-support.md）、互いに無関係な2ファイルが同名の外部interfaceを
+ *   別パッケージから import しているだけで、一方の`bind`がもう一方を汚染してしまう
+ *   （元々の再現例はローカル宣言だったが、それは companion で解消済み。
+ *   docs/bind-interface-token.md 1節）。この残った外部型のケースに以下のtoken対応が
+ *   必要（docs/type-identity-matching.md 案A(b) の「残る境界」）。
  *
  *   対応として、`injectable`/`bind`の左辺に任意の `as <トークン>` 句を
  *   追加できるようにした。トークンは`token Name;`という新しい構文
@@ -214,18 +235,53 @@
  */
 
 import { Lexer } from "./lexer.js";
-import { collectDeclaredTypeKinds } from "./analysis.js";
+import { collectDeclaredTypeKinds, trueInterfaceOrAliasNames, identityKeyableClassNames } from "./analysis.js";
 import { Parser } from "./parser.js";
-import { generate, resolveFromActivateBindings, generateFromImportStatements } from "./codegen.js";
+import {
+  generate,
+  resolveFromActivateBindings,
+  generateFromImportStatements,
+  generateCompanionDeclarations,
+  generateCompanionImportStatements,
+  collectDiUsedTypeNames,
+  companionName,
+  type KeyStrategy,
+  type CompanionImport,
+} from "./codegen.js";
 import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE } from "./runtime.js";
-import { findBindCollisions } from "./collisions.js";
-import type { DisonFileInput, BindCollisionDiagnostic } from "./collisions.js";
+import { findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
+import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo } from "./collisions.js";
 
 export interface TranspileOptions {
   // 指定すると、ランタイムの前置き（DI_REGISTRY等）をインライン生成する代わりに、
   // このパスからimportする文を生成する（複数ファイルでランタイム状態を共有する
   // ため）。省略時は従来通りインラインで生成する（単一ファイル利用の挙動）。
   runtimeModulePath?: string;
+
+  // bind/injectable の照合キーに「実体参照（クラスの値そのもの）」を使ってよい
+  // クラス識別子の追加集合（docs/type-identity-matching.md 案A(a)）。
+  // このファイル内でconcrete classとして宣言されたものは常に実体キー化されるため、
+  // ここに渡す必要はない。複数ファイルモードで、他のプロジェクトファイルから
+  // value-importされた具象クラス（このファイルではローカル宣言として見えないが、
+  // 宣言元ファイルと実体キーを一致させる必要があるもの）をCLIが解決して渡す。
+  // 省略時（単一ファイル利用）はローカル宣言の具象クラスのみが実体キー化される。
+  // 具象クラスに加え、このファイルのローカル abstract class も常に実体キー化される
+  // （abstract class は new 不可だが実行時に値を持つため）。
+  identityKeyClasses?: Iterable<string>;
+
+  // このファイルで宣言された真の interface/型エイリアスのうち、companion Symbol を
+  // 追加で emit すべき名前（docs/type-identity-matching.md 案A(b)）。このファイル内で
+  // DI利用（bind左辺/injectable型）される interface は常に emit されるため、ここに
+  // 渡すのは「他ファイルで DI利用されるが、このファイル自身では使っていない」ローカル
+  // 宣言の名前（複数ファイルモードでCLIが解決して渡す）。省略時（単一ファイル利用）は
+  // ローカルの DI利用 interface だけが emit される。
+  companionEmit?: Iterable<string>;
+
+  // 他プロジェクトファイルで宣言された interface/型エイリアスを DI で使う場合に、その
+  // companion Symbol を import して照合キーに使うための情報（案A(c)）。キーはこの
+  // ファイルでのローカル型名。複数ファイルモードでCLIが解決して渡す（単一ファイル利用
+  // では空 = 外部由来の型は文字列キーにフォールバック）。
+  companionImports?: Map<string, CompanionImportInfo>;
 }
 
 /**
@@ -238,7 +294,49 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   const typeKinds = collectDeclaredTypeKinds(tokens);
   const ast = new Parser(tokens, typeKinds).parseProgram();
   const fromBindings = resolveFromActivateBindings(ast);
-  const body = generate(ast, fromBindings);
+
+  // 実体キー化してよいクラス識別子の集合 = このファイルのローカル具象クラス
+  // ＋ローカル abstract class ∪ 呼び出し側が渡した集合（複数ファイルモードで
+  // value-importされたプロジェクトのクラス）。裸の識別子かつこの集合に含まれる型
+  // だけが実体参照でキー化される（docs/type-identity-matching.md 案A(a)）。
+  const identityKeyClasses = identityKeyableClassNames(typeKinds);
+  for (const name of options.identityKeyClasses ?? []) identityKeyClasses.add(name);
+  const isIdentityClass = (id: string) => identityKeyClasses.has(id);
+
+  // companion Symbol でキー化する真の interface/型エイリアス（案A(b)）。
+  //   - ローカル宣言の真の interface/型エイリアス → このファイルで emit した companion。
+  //   - 他プロジェクトファイルから import したもの（options.companionImports）→ import
+  //     した companion。
+  // どちらもキーには companionName(ローカル型名) を使う（宣言側の emit 名と import 側の
+  // ローカル別名が一致するよう、codegen 側で import 文にエイリアスを付ける）。
+  const localTrueInterfaces = trueInterfaceOrAliasNames(typeKinds);
+  const companionImports = options.companionImports ?? new Map<string, CompanionImportInfo>();
+  const companionRefOf = (id: string): string | undefined => {
+    if (localTrueInterfaces.has(id) || companionImports.has(id)) return companionName(id);
+    return undefined;
+  };
+
+  const strategy: KeyStrategy = { isIdentityClass, companionRefOf };
+  const body = generate(ast, fromBindings, strategy);
+
+  // emit する companion = このファイルで DI利用されるローカル真 interface
+  // ∪ 呼び出し側が渡した追加分（他ファイルで DI利用されるローカル宣言）。
+  const diUsed = collectDiUsedTypeNames(ast);
+  const companionEmitNames = new Set<string>();
+  for (const name of localTrueInterfaces) {
+    if (diUsed.has(name)) companionEmitNames.add(name);
+  }
+  for (const name of options.companionEmit ?? []) {
+    if (localTrueInterfaces.has(name)) companionEmitNames.add(name);
+  }
+
+  // import する companion = このファイルで DI利用される、他ファイル由来の interface。
+  const companionImportList: CompanionImport[] = [];
+  for (const [localName, info] of companionImports) {
+    if (diUsed.has(localName)) {
+      companionImportList.push({ localName, originalName: info.originalName, specifier: info.specifier });
+    }
+  }
 
   const header = `// --- Auto-generated TypeScript code ---\n\n`;
   const prelude = options.runtimeModulePath
@@ -247,15 +345,18 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
     : `${header}${generateRuntimeDeclarations("")}\n`;
 
-  // "activate Name from '...';" が使われている場合、対応するimport文を
-  // ランタイムの前置きの直後・生成本体の前にまとめて出力する
-  // （ES Modulesのimportはファイル先頭にしか書けないため）。
+  // ES Modules の import はファイル先頭にしか書けないため、import 系（companion import、
+  // "activate ... from" の import）を前置きの直後にまとめて出す。companion の const 宣言
+  // （export const __dison_token_X = Symbol(...)）は import ではないので、すべての import
+  // の後・生成本体の前に置く。
+  const companionImportsStr = generateCompanionImportStatements(companionImportList);
   const fromImports = generateFromImportStatements(fromBindings);
+  const companionDecls = generateCompanionDeclarations([...companionEmitNames]);
 
-  return prelude + fromImports + body;
+  return prelude + companionImportsStr + fromImports + companionDecls + body;
 }
 
 // 公開API: 複数ファイル対応（docs/multi-file-support.md、
 // docs/bind-interface-token.md）。CLIが複数ファイルを一括処理する際に使う。
-export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions };
-export type { DisonFileInput, BindCollisionDiagnostic };
+export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile };
+export type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo };

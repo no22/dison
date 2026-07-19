@@ -30,16 +30,22 @@ interface IRepository {}
 class Mock implements IRepository {}
 configuration Cfg { bind IRepository as IRepositoryToken = Mock; }
 `);
-    expect(out).toContain('bindType<IRepository>(IRepositoryToken, () => resolveType("Mock"');
+    // 左辺のキーはトークン（IRepositoryToken）。差し替え先 Mock は具象クラスなので
+    // 実体参照キー（resolveType(Mock, ...)）になる。
+    expect(out).toContain('bindType<IRepository>(IRepositoryToken, () => resolveType(Mock,');
   });
 
-  it("as句が無ければ従来通り文字列キーのまま", () => {
+  it("as句が無いローカルinterfaceは companion Symbol でキー化される（案A(b)）", () => {
+    // 以前は文字列キー "IRepository" だったが、案A(b)の companion 自動付与により
+    // 宣言ごとの Symbol でキー化される（手動tokenなしで衝突回避）。明示的な as/token は
+    // 上書き手段として引き続き使える（keyExprFor はトークン最優先）。
     const out = transpileDisonToTS(`
 interface IRepository {}
 class Impl implements IRepository {}
 class S { injectable dep: IRepository = new Impl(); }
 `);
-    expect(out).toContain('resolveType("IRepository"');
+    expect(out).toContain('export const __dison_token_IRepository = Symbol("IRepository");');
+    expect(out).toContain("resolveType(__dison_token_IRepository, () => (new Impl()))");
   });
 
   it("as の後に識別子以外が来るとパースエラーになる", () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'fs';
 import * as path from 'path';
-import { transpileDisonToTS, findBindCollisions } from './core.js'; // ※NodeNext環境のために.jsをつけます
+import { transpileDisonToTS, findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from './core.js'; // ※NodeNext環境のために.jsをつけます
 
 // 複数ファイルの生成コードが共有ランタイム（DI_REGISTRY/TYPE_BINDINGS等）を
 // importする際に使うパッケージのサブパス。@no22/disonパッケージ自身が
@@ -67,8 +67,24 @@ function transpileMultipleFiles(inputFiles: string[]): void {
 
   console.log(`🎉 Using "${RUNTIME_PACKAGE_SPECIFIER}" as the shared runtime (the target project must have "@no22/dison" installed as a dependency).`);
 
+  // 各ファイルが他のプロジェクトファイルからvalue-importしている具象クラスを解決し、
+  // 宣言元ファイルと同じ実体キーを使うよう transpile に渡す（docs/type-identity-
+  // matching.md 案A(a)。これが無いと、宣言側は実体キー・import側は文字列キーになり
+  // 複数ファイルモードで bind がサイレントに効かなくなる）。
+  const identityKeyClassesByFile = computeIdentityKeyClassesByFile(fileInputs);
+
+  // interface/型エイリアスの companion Symbol 計画（案A(b)(c)）。宣言元ファイルが
+  // DI利用される companion を emit・export し、import 側にはその import を注入する。
+  const companionPlanByFile = computeCompanionPlanByFile(fileInputs);
+
   for (const file of fileInputs) {
-    const generatedTS = transpileDisonToTS(file.source, { runtimeModulePath: RUNTIME_PACKAGE_SPECIFIER });
+    const companionPlan = companionPlanByFile.get(file.path);
+    const generatedTS = transpileDisonToTS(file.source, {
+      runtimeModulePath: RUNTIME_PACKAGE_SPECIFIER,
+      identityKeyClasses: identityKeyClassesByFile.get(file.path),
+      companionEmit: companionPlan?.companionEmit,
+      companionImports: companionPlan?.companionImports,
+    });
     const outputFile = outputPathFor(file.path);
     fs.writeFileSync(outputFile, generatedTS, 'utf-8');
     console.log(`🎉 Success: ${file.path} ➔ ${outputFile}`);

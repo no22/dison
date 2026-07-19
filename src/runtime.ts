@@ -17,11 +17,15 @@
 //   - 複数ファイルにまたがって同名クラスが存在しても、参照そのものが
 //     キーになるため衝突しない（docs/multi-file-support.md参照）。
 //
-// TYPE_BINDINGS（bind用）は従来通り型名の文字列でキー化する。bindの左辺は
-// interface/型エイリアスもあり得るが、これらは実行時に値を持たないため
-// DI_REGISTRYと同じ手法（実体参照でのキー化）が使えない。複数ファイルに
-// またがるinterface/型エイリアスの名前衝突は未解決の課題として残る
-// （docs/multi-file-support.md 3.4節）。
+// TYPE_BINDINGS（bind用）のキーは、型が具象クラスなら実体参照（Function）、
+// それ以外（interface/型エイリアス/ジェネリクス）なら型名の文字列を使う。
+// 具象クラスの実体キー化はDI_REGISTRYと同じ発想で、複数ファイルにまたがる
+// 同名クラスが衝突しなくなる（手動tokenなしで自動的に別の実体として区別される。
+// どの型を実体キーにするかの判定はcodegen/collisionsが担う。
+// docs/type-identity-matching.md）。bindの左辺がinterface/型エイリアスの場合は
+// 実行時に値が無いため実体参照できず、文字列キーのまま。複数ファイルに
+// またがる同名interface/型エイリアスの衝突は "as <トークン>" で回避する
+// （docs/bind-interface-token.md）。
 export function generateRuntimeDeclarations(exportKeyword: "" | "export "): string {
   return (
     `// Global dependency registry (per-property override).\n` +
@@ -40,26 +44,34 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `  return DI_REGISTRY.get(cls)?.[prop];\n` +
     `}\n\n` +
     `// Global type-replacement registry (bind).\n` +
-    `// The key is either a type-name string (class, interface, or type alias name)\n` +
-    `// or a Symbol explicitly given via an "as <token>" clause (used to avoid\n` +
-    `// name collisions between same-named interfaces/type aliases across files).\n` +
-    `${exportKeyword}const TYPE_BINDINGS = new Map<string | symbol, () => any>();\n` +
-    `const _resolvingTypeBindings = new Set<string | symbol>();\n\n` +
+    `// The key is one of:\n` +
+    `//   - The class itself (Function). When a bind/injectable type is a concrete\n` +
+    `//     class, the class value (not its name string) is used as the key (same\n` +
+    `//     idea as DI_REGISTRY). Same-named classes across files no longer collide\n` +
+    `//     as a result (no manual token needed; with string keys, unrelated\n` +
+    `//     same-named classes used to pollute each other).\n` +
+    `//   - A type-name string. Used for interfaces/type aliases (no runtime value)\n` +
+    `//     and generics with concrete type arguments (Repository<User>).\n` +
+    `//   - A Symbol explicitly given via an "as <token>" clause (to avoid collisions\n` +
+    `//     between same-named interfaces/type aliases across files. docs/bind-interface-token.md).\n` +
+    `${exportKeyword}const TYPE_BINDINGS = new Map<string | symbol | Function, () => any>();\n` +
+    `const _resolvingTypeBindings = new Set<string | symbol | Function>();\n\n` +
     `// bindType<T> takes T as an explicit type argument, so tsc raises a\n` +
     `// compile error if the replacement factory isn't compatible with the\n` +
     `// original type. T may be an interface or type alias (used only as a\n` +
     `// type argument).\n` +
-    `${exportKeyword}function bindType<T>(typeKey: string | symbol, factory: () => T): void {\n` +
+    `${exportKeyword}function bindType<T>(typeKey: string | symbol | Function, factory: () => T): void {\n` +
     `  TYPE_BINDINGS.set(typeKey, factory);\n` +
     `}\n\n` +
     `// Resolves a value by recursively walking TYPE_BINDINGS. bind chains\n` +
     `// (e.g. bind A = B; bind B = C; makes resolving A eventually reach C).\n` +
     `// A cycle (A -> B -> A) raises a clear error instead of a stack overflow.\n` +
-    `${exportKeyword}function resolveType<T>(typeKey: string | symbol, defaultFactory: () => T): T {\n` +
+    `${exportKeyword}function resolveType<T>(typeKey: string | symbol | Function, defaultFactory: () => T): T {\n` +
     `  const bound = TYPE_BINDINGS.get(typeKey);\n` +
     `  if (!bound) return defaultFactory();\n` +
     `  if (_resolvingTypeBindings.has(typeKey)) {\n` +
-    `    throw new Error('Detected a circular "bind" reference ("' + String(typeKey) + '"). The bind chain loops back on itself.');\n` +
+    `    const label = typeof typeKey === 'function' ? (typeKey.name || '<anonymous class>') : String(typeKey);\n` +
+    `    throw new Error('Detected a circular "bind" reference ("' + label + '"). The bind chain loops back on itself.');\n` +
     `  }\n` +
     `  _resolvingTypeBindings.add(typeKey);\n` +
     `  try {\n` +

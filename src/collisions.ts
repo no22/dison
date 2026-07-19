@@ -5,12 +5,40 @@
 import * as path from "path";
 import { Lexer } from "./lexer.js";
 import type { BindEntry } from "./ast.js";
-import { collectDeclaredTypeKinds, collectImportOrigins, isSimpleTypeShape, baseIdentifierOf } from "./analysis.js";
+import {
+  collectDeclaredTypeKinds,
+  collectImportOrigins,
+  collectImportBindings,
+  trueInterfaceOrAliasNames,
+  identityKeyableClassNames,
+  isSimpleTypeShape,
+  baseIdentifierOf,
+} from "./analysis.js";
+import { collectDiUsedTypeNames } from "./codegen.js";
 import { Parser } from "./parser.js";
 
 export interface DisonFileInput {
   path: string;
   source: string;
+}
+
+// 他プロジェクトファイルで宣言された interface/型エイリアスを DI で使う際、その
+// companion Symbol をどこから import するかの情報（docs/type-identity-matching.md
+// 案A(c)）。originalName は宣言元ファイルでの元の export 名（import 側で
+// `import { IFoo as Bar }` とエイリアスされていても、companion の名前は元名で決まる）。
+export interface CompanionImportInfo {
+  specifier: string;
+  originalName: string;
+}
+
+// 複数ファイルモードで各ファイルの transpile に渡す companion 計画（案A(b)(c)）。
+export interface CompanionPlan {
+  // このファイルで emit すべき companion（ローカル宣言の真 interface/型エイリアスの
+  // うち、プロジェクト内のどこかで DI利用されるもの）。
+  companionEmit: Set<string>;
+  // このファイルで DI利用される、他プロジェクトファイル由来の interface/型エイリアス。
+  // キーはこのファイルでのローカル型名。
+  companionImports: Map<string, CompanionImportInfo>;
 }
 
 export interface BindCollisionDiagnostic {
@@ -36,6 +64,167 @@ function normalizeExtensionlessAbsolutePath(filePath: string): string {
   return ext ? abs.slice(0, -ext.length) : abs;
 }
 
+// 全入力ファイルから「正規化パス -> そのファイルで宣言された実体キー化可能な
+// クラス名（具象 ＋ abstract）の集合」のインデックスを作る。value-importされた
+// クラスの実体キー解決に使う。abstract class も実行時に値を持つので含める。
+function buildProjectClassIndex(files: DisonFileInput[]): Map<string, Set<string>> {
+  const index = new Map<string, Set<string>>();
+  for (const file of files) {
+    const tokens = new Lexer(file.source).tokenize();
+    const kinds = collectDeclaredTypeKinds(tokens);
+    index.set(normalizeExtensionlessAbsolutePath(file.path), identityKeyableClassNames(kinds));
+  }
+  return index;
+}
+
+// 全入力ファイルから「正規化パス -> そのファイルで宣言された真の interface/型
+// エイリアス名の集合」のインデックスを作る（abstract class は含めない＝実体キー側）。
+// companion Symbol でキー化する型のクロスファイル解決に使う（案A(b)(c)）。
+function buildProjectInterfaceIndex(files: DisonFileInput[]): Map<string, Set<string>> {
+  const index = new Map<string, Set<string>>();
+  for (const file of files) {
+    const tokens = new Lexer(file.source).tokenize();
+    const kinds = collectDeclaredTypeKinds(tokens);
+    index.set(normalizeExtensionlessAbsolutePath(file.path), trueInterfaceOrAliasNames(kinds));
+  }
+  return index;
+}
+
+// あるファイルが「他のプロジェクトファイルから import している真の interface/型
+// エイリアス」を、ローカル名 -> {specifier, 元名} で返す。companion は値として別途
+// import するため、interface 自体が型onlyインポート（import type）でも対象にする
+// （実体キー化するクラスと違い、値importである必要がない。案A(b)(c)）。
+function importedProjectInterfaceLocalNames(
+  file: DisonFileInput,
+  interfaceIndex: Map<string, Set<string>>
+): Map<string, CompanionImportInfo> {
+  const result = new Map<string, CompanionImportInfo>();
+  const tokens = new Lexer(file.source).tokenize();
+  for (const imp of collectImportBindings(tokens)) {
+    if (!imp.specifier.startsWith(".")) continue; // 外部パッケージは companion が無いので対象外
+    const resolved = normalizeExtensionlessAbsolutePath(path.resolve(path.dirname(file.path), imp.specifier));
+    const interfaces = interfaceIndex.get(resolved);
+    if (interfaces && interfaces.has(imp.importedName)) {
+      result.set(imp.localName, { specifier: imp.specifier, originalName: imp.importedName });
+    }
+  }
+  return result;
+}
+
+// あるファイルが「他のプロジェクトファイルからvalue-importしている具象クラス」の
+// ローカル名の集合を返す（型onlyインポートや外部パッケージ由来は除く）。
+// 宣言元ファイルはそのクラスをローカル宣言として実体キー化するので、import側も
+// 同じ実体（ES Modulesの共有束縛）を実体キーにすることで、複数ファイルにまたがる
+// bind/injectableが同じキーで一致する（docs/type-identity-matching.md 案A(a)）。
+function importedProjectClassLocalNames(
+  file: DisonFileInput,
+  classIndex: Map<string, Set<string>>
+): Set<string> {
+  const names = new Set<string>();
+  const tokens = new Lexer(file.source).tokenize();
+  for (const imp of collectImportBindings(tokens)) {
+    if (imp.typeOnly) continue; // 型onlyインポートは実行時に値が無く実体キーに使えない
+    if (!imp.specifier.startsWith(".")) continue; // 外部パッケージは解決しない
+    const resolved = normalizeExtensionlessAbsolutePath(path.resolve(path.dirname(file.path), imp.specifier));
+    const classes = classIndex.get(resolved);
+    if (classes && classes.has(imp.importedName)) names.add(imp.localName);
+  }
+  return names;
+}
+
+/**
+ * 複数ファイルモードで、各ファイルの `transpileDisonToTS` に渡す「実体キー化する
+ * 追加クラス識別子」の集合を計算する（docs/type-identity-matching.md 案A(a)）。
+ *
+ * ローカル宣言の具象クラスは `transpileDisonToTS` 側が typeKinds から自動的に
+ * 実体キー化するため、ここには含めない。ここで返すのは「他のプロジェクトファイルから
+ * value-importされた具象クラスのローカル名」だけ。これにより、宣言元ファイル
+ * （ローカル実体キー化）と、それをimportして使う側ファイルの双方が、同じクラス実体を
+ * キーに使うようになり、複数ファイルモードでのキー食い違い（サイレントに bind が
+ * 効かなくなる回帰）を防ぐ。
+ */
+export function computeIdentityKeyClassesByFile(files: DisonFileInput[]): Map<string, Set<string>> {
+  const classIndex = buildProjectClassIndex(files);
+  const result = new Map<string, Set<string>>();
+  for (const file of files) {
+    result.set(file.path, importedProjectClassLocalNames(file, classIndex));
+  }
+  return result;
+}
+
+/**
+ * 複数ファイルモードで、各ファイルの `transpileDisonToTS` に渡す companion 計画を
+ * 計算する（docs/type-identity-matching.md 案A(b)(c)）。
+ *
+ * 真の interface/型エイリアスは実行時に値を持たないため、宣言ごとに一意な companion
+ * Symbol を自動生成してキーにする。emit は「プロジェクト内のどこかで DI利用される」
+ * ものだけに絞る（案2）。宣言元ファイルが companion を emit・export し、それを
+ * import して使う側ファイルには companion の import を注入する。
+ *
+ * 返り値: ファイルパス -> CompanionPlan（emit するローカル名の集合、import する
+ * 他ファイル由来 interface のローカル名 -> {specifier, 元名}）。
+ */
+export function computeCompanionPlanByFile(files: DisonFileInput[]): Map<string, CompanionPlan> {
+  const interfaceIndex = buildProjectInterfaceIndex(files);
+
+  // 各ファイルの前処理（トークン化・パース・ローカル真interface・import解決・DI利用集合）。
+  interface Pre {
+    file: DisonFileInput;
+    normPath: string;
+    localTrueInterfaces: Set<string>;
+    importedInterfaces: Map<string, CompanionImportInfo>;
+    diUsed: Set<string>;
+  }
+  const pre: Pre[] = files.map((file) => {
+    const tokens = new Lexer(file.source).tokenize();
+    const kinds = collectDeclaredTypeKinds(tokens);
+    const ast = new Parser(tokens, kinds).parseProgram();
+    return {
+      file,
+      normPath: normalizeExtensionlessAbsolutePath(file.path),
+      localTrueInterfaces: trueInterfaceOrAliasNames(kinds),
+      importedInterfaces: importedProjectInterfaceLocalNames(file, interfaceIndex),
+      diUsed: collectDiUsedTypeNames(ast),
+    };
+  });
+
+  // プロジェクト全体で DI利用される interface/型エイリアスの「宣言」の集合
+  // （declKey = 正規化パス::元名）。ローカル利用・import 利用の両方から集める。
+  const globalDiUsedDecls = new Set<string>();
+  for (const p of pre) {
+    for (const name of p.diUsed) {
+      if (p.localTrueInterfaces.has(name)) {
+        globalDiUsedDecls.add(`${p.normPath}::${name}`);
+      } else {
+        const imp = p.importedInterfaces.get(name);
+        if (imp) {
+          const declPath = normalizeExtensionlessAbsolutePath(
+            path.resolve(path.dirname(p.file.path), imp.specifier)
+          );
+          globalDiUsedDecls.add(`${declPath}::${imp.originalName}`);
+        }
+      }
+    }
+  }
+
+  const result = new Map<string, CompanionPlan>();
+  for (const p of pre) {
+    // emit: このファイルのローカル真interfaceのうち、プロジェクト内のどこかで DI利用
+    // されるもの。
+    const companionEmit = new Set<string>();
+    for (const name of p.localTrueInterfaces) {
+      if (globalDiUsedDecls.has(`${p.normPath}::${name}`)) companionEmit.add(name);
+    }
+    // import: このファイルで DI利用される、他ファイル由来の interface。
+    const companionImports = new Map<string, CompanionImportInfo>();
+    for (const [localName, info] of p.importedInterfaces) {
+      if (p.diUsed.has(localName)) companionImports.set(localName, info);
+    }
+    result.set(p.file.path, { companionEmit, companionImports });
+  }
+  return result;
+}
+
 /**
  * 複数の.disファイルを横断して、`bind`の左辺や`injectable`の型注釈に
  * 使われている型名（クラス/interface/型エイリアスを問わない）の衝突を
@@ -55,11 +244,42 @@ function normalizeExtensionlessAbsolutePath(filePath: string): string {
 export function findBindCollisions(files: DisonFileInput[]): BindCollisionDiagnostic[] {
   const occurrencesByName = new Map<string, CollisionOccurrence[]>();
 
+  // 実体キー化される具象/abstractクラス、および companion Symbol でキー化される
+  // interface/型エイリアスは、文字列キーの共有プールに載らないため衝突しない
+  // （前者は宣言ごとに別の実体、後者は宣言ごとに別の Symbol がキーになる）。よって
+  // 衝突検出の対象から除外する。残るのは文字列キーのまま（外部パッケージ由来の
+  // interface/型エイリアスなど、companion を import できないもの）だけ。
+  // (docs/type-identity-matching.md 案A(a)(b))。
+  const classIndex = buildProjectClassIndex(files);
+  const interfaceIndex = buildProjectInterfaceIndex(files);
+
   for (const file of files) {
     const tokens = new Lexer(file.source).tokenize();
     const typeKinds = collectDeclaredTypeKinds(tokens);
     const importOrigins = collectImportOrigins(tokens);
     const ast = new Parser(tokens, typeKinds).parseProgram();
+
+    // このファイルで実体キー化される裸のクラス識別子（ローカル具象＋abstract ∪
+    // value-importされたプロジェクトのクラス）。
+    const identityClasses = identityKeyableClassNames(typeKinds);
+    for (const n of importedProjectClassLocalNames(file, classIndex)) identityClasses.add(n);
+
+    // このファイルで companion Symbol でキー化される裸の interface/型エイリアス識別子
+    // （ローカル宣言の真interface ∪ 他プロジェクトファイル由来の import）。
+    const companionTypes = trueInterfaceOrAliasNames(typeKinds);
+    for (const localName of importedProjectInterfaceLocalNames(file, interfaceIndex).keys()) {
+      companionTypes.add(localName);
+    }
+
+    // 型が実体参照 or companion でキー化されるか（＝文字列プールに載らず衝突対象外か）。
+    // キー化は「as トークンなし」かつ「ジェネリクスを含まない裸の識別子」のときだけ
+    // 効く。keyExprFor（codegen）と同じ条件。
+    const isNonStringKeyed = (typeKey: string, hasToken: boolean): boolean => {
+      if (hasToken) return false;
+      const base = baseIdentifierOf(typeKey);
+      if (base !== typeKey) return false;
+      return identityClasses.has(base) || companionTypes.has(base);
+    };
 
     const originOf = (name: string): { key: string; label: string } | null => {
       if (typeKinds.classNames.has(name) || typeKinds.nonNewableTypeNames.has(name)) {
@@ -100,13 +320,16 @@ export function findBindCollisions(files: DisonFileInput[]): BindCollisionDiagno
     };
 
     const visitBindEntry = (entry: BindEntry, describe: string) => {
+      // 実体キー or companion でキー化される bind 左辺は衝突しないので記録しない。
+      if (isNonStringKeyed(entry.originalTypeKey, entry.token !== undefined)) return;
       const base = baseIdentifierOf(entry.originalTypeKey);
       record(base, describe, entry.token !== undefined);
     };
 
     for (const node of ast) {
       if (node.kind === "injectable") {
-        if (isSimpleTypeShape(node.typeKey)) {
+        // 実体キー or companion でキー化される injectable 型は衝突しないので記録しない。
+        if (isSimpleTypeShape(node.typeKey) && !isNonStringKeyed(node.typeKey, node.token !== undefined)) {
           record(baseIdentifierOf(node.typeKey), `injectable "${node.propName}"`, node.token !== undefined);
         }
       } else if (node.kind === "configuration") {

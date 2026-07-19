@@ -3,7 +3,51 @@
 // =====================================================================
 
 import type { Node, OverrideEntry, BindEntry } from "./ast.js";
-import { isSimpleTypeShape } from "./analysis.js";
+import { isSimpleTypeShape, baseIdentifierOf } from "./analysis.js";
+
+// bind/injectable の照合キーをどう決めるかの戦略。型の種別に応じてキーが変わる。
+export interface KeyStrategy {
+  // その裸の識別子が「実行時に値を持つクラス（具象 or abstract）」か。true なら
+  // クラスの実体参照をキーにする（docs/type-identity-matching.md 案A(a)）。ローカル
+  // 宣言のクラス、または複数ファイルモードで他プロジェクトファイルからvalue-import
+  // された具象/abstract クラス。
+  isIdentityClass: (id: string) => boolean;
+  // その裸の識別子が「companion Symbol でキー化する真の interface/型エイリアス」なら、
+  // キーに使う companion 識別子（例 "__dison_token_IRepo"）を返す。そうでなければ
+  // undefined（docs/type-identity-matching.md 案A(b)）。ローカル宣言の interface で
+  // DI利用されるもの、または他プロジェクトファイルからimportした interface。
+  companionRefOf: (id: string) => string | undefined;
+}
+
+// companion Symbol の識別子名。宣言元ファイルの emit 名と、import 側の参照名が
+// 一致する必要があるため、型名の決定的関数にする（利用者コードと衝突しにくい接頭辞）。
+export function companionName(typeName: string): string {
+  return `__dison_token_${typeName}`;
+}
+
+// bind/injectable の照合キー式を組み立てる。優先順位:
+//   1. "as <トークン>" 句があればそのトークン参照（最優先。利用者の明示指定）。
+//   2. ジェネリクスを含まない裸の識別子で「実行時に値を持つクラス（具象/abstract）」
+//      なら、クラスの実体参照（識別子そのもの）。実行時に値を持つため複数ファイルに
+//      またがる同名クラスが別の実体として自動的に区別され、手動tokenなしで衝突しない
+//      （案A(a)）。なお bind 左辺のタイプミスは実体キーの有無に関わらず bindType<T> の
+//      型引数が元々検出するため、これは実体キー化の固有の利得ではない。
+//   3. 裸の識別子で「真の interface/型エイリアス（実行時に値が無い）」なら、宣言ごとに
+//      自動生成した companion Symbol の識別子（案A(b)）。これも同名でも別 Symbol 値
+//      として区別され、手動tokenなしで衝突しない。
+//   4. それ以外（外部パッケージ由来の型、または具体的な型引数を持つジェネリクス）は
+//      正規化済みの型名文字列。ジェネリクスは型引数の区別（Repository<User> 対
+//      Repository<Admin>）を保つため文字列が必要。外部由来の型は companion を
+//      import できないため文字列（衝突回避は従来の token/as に委ねる）。
+function keyExprFor(typeKey: string, token: string | undefined, strategy: KeyStrategy): string {
+  if (token !== undefined) return token;
+  const base = baseIdentifierOf(typeKey);
+  if (base !== typeKey) return JSON.stringify(typeKey); // ジェネリクス等の複合型は文字列
+  if (strategy.isIdentityClass(base)) return base;
+  const companion = strategy.companionRefOf(base);
+  if (companion !== undefined) return companion;
+  return JSON.stringify(typeKey);
+}
 
 // override 1件分のDI_REGISTRY代入文を生成する。configuration内（関数本体に
 // 収集される場合）と、configurationで包まない単独のoverride（その場に直接
@@ -44,21 +88,28 @@ function generateOverrideEntryLines(entry: OverrideEntry): string[] {
 // 連鎖: 差し替え先クラス自身がさらに bind されている可能性があるので、
 // 直接 new せず resolveType を介して再帰的に解決する。
 // （bind A = B; bind B = C; と書けば、Aの解決は最終的にCまで辿る）
-function generateBindEntryLines(entry: BindEntry): string[] {
-  const originalKeyExpr = entry.token !== undefined ? entry.token : JSON.stringify(entry.originalTypeKey);
-  const replacementKey = JSON.stringify(entry.replacementTypeKey);
+function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy): string[] {
+  const originalKeyExpr = keyExprFor(entry.originalTypeKey, entry.token, strategy);
+  // 差し替え先（replacement）は `new` で実体化される具象クラスなので、それ自身が
+  // さらに bind の左辺になっている場合の連鎖解決キーも、左辺と同じ規則で決める
+  // （具象クラスなら実体参照、そうでなければ文字列/companion）。左辺と同じ戦略を使う
+  // ことで、ある型が「bindの左辺」と「別のbindの差し替え先」の両方に現れてもキーが一致する。
+  const replacementKeyExpr = keyExprFor(entry.replacementTypeKey, undefined, strategy);
   return [
-    `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => resolveType(${replacementKey}, () => new ${entry.replacementTypeName}()));`,
+    `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}()));`,
   ];
 }
 
-function generateConfiguration(node: Extract<Node, { kind: "configuration" }>): string {
+function generateConfiguration(
+  node: Extract<Node, { kind: "configuration" }>,
+  strategy: KeyStrategy
+): string {
   const lines: string[] = [];
   for (const entry of node.entries) {
     if (entry.kind === "override") {
       lines.push(...generateOverrideEntryLines(entry));
     } else {
-      lines.push(...generateBindEntryLines(entry));
+      lines.push(...generateBindEntryLines(entry, strategy));
     }
   }
   // export しておくことで、他ファイルから import { activateName } して
@@ -68,7 +119,10 @@ function generateConfiguration(node: Extract<Node, { kind: "configuration" }>): 
   return `export function activate${node.name}() {\n${lines.join("\n")}\n}`;
 }
 
-function generateInjectable(node: Extract<Node, { kind: "injectable" }>): string {
+function generateInjectable(
+  node: Extract<Node, { kind: "injectable" }>,
+  strategy: KeyStrategy
+): string {
   const { propName: p, typeName: t, typeKey: k, defaultExpr, token } = node;
   const simpleShape = isSimpleTypeShape(k);
 
@@ -82,12 +136,12 @@ function generateInjectable(node: Extract<Node, { kind: "injectable" }>): string
   // 試みる。interfaceや型エイリアスも文字列キーとして扱えるため、これ自体は
   // コンパイル上安全。実際にbindされていなければ finalDefault にフォールバック
   // する。優先順位: プロパティ単位の override > 型単位の bind > 宣言済みの既定
-  // 初期化式。照合キーには typeName ではなく正規化済みの typeKey を使う
-  // （bind側のキー生成と同じ規則にそろえ、空白の書き方差で一致しなくなるのを
-  // 防ぐ。詳細はファイル冒頭のヘッダーコメント参照）。"as <トークン>"句が
-  // 指定されている場合は、文字列キーの代わりにそのトークンの識別子参照を
-  // そのままキーとして使う（docs/bind-interface-token.md）。
-  const keyExpr = token !== undefined ? token : JSON.stringify(k);
+  // 初期化式。照合キーは keyExprFor が決める（bind側と同じ規則: 実行時に値を持つ
+  // クラスは実体参照、真の interface/型エイリアスは companion Symbol、ジェネリクスや
+  // 外部由来の型は正規化済みの typeKey 文字列、"as <トークン>"句があればそのトークン
+  // 参照）。bind側とキー生成規則をそろえることで、injectableの型注釈とbindの左辺が
+  // 同じキーで一致する。
+  const keyExpr = keyExprFor(k, token, strategy);
   const fallback = simpleShape ? `resolveType(${keyExpr}, () => ${finalDefault})` : finalDefault;
 
   // strictモードでは `if (!this._x) { this._x = f(); }` の後の `return this._x;` は
@@ -104,7 +158,6 @@ function generateInjectable(node: Extract<Node, { kind: "injectable" }>): string
     `    }`,
     `    return this._${p}!;`,
     `  }`,
-    `  set ${p}(value: ${t}) { this._${p} = value; }`,
     ``,
   ].join("\n");
 }
@@ -161,7 +214,67 @@ export function generateFromImportStatements(bindings: Map<string, FromActivateB
   return lines.join("\n") + "\n\n";
 }
 
-export function generate(nodes: Node[], fromBindings: Map<string, FromActivateBinding>): string {
+// DI利用される真の interface/型エイリアスのうち、このファイルで宣言されているものに
+// 対して companion Symbol を emit する（案A(b)）。宣言ごとに一意な Symbol を作ることで、
+// 複数ファイルにまたがる同名 interface が別の値として区別される。トップに巻き上げて
+// よい（Symbol を作るだけで interface 宣言を参照しないため）。names は emit する
+// ローカル宣言名の配列。
+export function generateCompanionDeclarations(names: string[]): string {
+  if (names.length === 0) return "";
+  const lines = names.map(
+    (name) => `export const ${companionName(name)} = Symbol(${JSON.stringify(name)});`
+  );
+  return lines.join("\n") + "\n\n";
+}
+
+// 他プロジェクトファイルで宣言された interface/型エイリアスを DI で使う場合に、その
+// companion Symbol を import する文を生成する（案A(c)）。import 側のローカル型名が
+// 宣言元の元名と違う（`import { IFoo as Bar }`）場合は、companion も
+// `{ __dison_token_IFoo as __dison_token_Bar }` の形で取り込み、キーとしては
+// ローカル名側（__dison_token_Bar）を使う。ES Modules の import はファイル先頭に
+// しか置けないため、まとめてここで生成して前置きに出す。
+export interface CompanionImport {
+  localName: string; // このファイルでの型名
+  originalName: string; // 宣言元ファイルでの元の export 名
+  specifier: string; // import 元
+}
+
+export function generateCompanionImportStatements(imports: CompanionImport[]): string {
+  if (imports.length === 0) return "";
+  const lines = imports.map(({ localName, originalName, specifier }) => {
+    const exportedSym = companionName(originalName);
+    const localSym = companionName(localName);
+    const spec = exportedSym === localSym ? exportedSym : `${exportedSym} as ${localSym}`;
+    return `import { ${spec} } from ${JSON.stringify(specifier)};`;
+  });
+  return lines.join("\n") + "\n";
+}
+
+// AST から「DIで実際に使われている型名（裸の識別子部分）」を集める。
+// 対象は injectable の型注釈と bind の左辺（差し替え元）。bind の差し替え先は常に
+// `new` される具象クラスで companion 対象にならないため含めない。companion を emit
+// すべきローカル interface の絞り込み（DI利用のもののみ emit）や、複数ファイルの
+// companion 計画（docs/type-identity-matching.md 案A(b) 案2）で使う。
+export function collectDiUsedTypeNames(nodes: Node[]): Set<string> {
+  const names = new Set<string>();
+  const addBind = (e: BindEntry) => names.add(baseIdentifierOf(e.originalTypeKey));
+  for (const node of nodes) {
+    if (node.kind === "injectable") {
+      if (isSimpleTypeShape(node.typeKey)) names.add(baseIdentifierOf(node.typeKey));
+    } else if (node.kind === "configuration") {
+      for (const e of node.entries) if (e.kind === "bind") addBind(e);
+    } else if (node.kind === "standalone-bind") {
+      addBind(node.entry);
+    }
+  }
+  return names;
+}
+
+export function generate(
+  nodes: Node[],
+  fromBindings: Map<string, FromActivateBinding>,
+  strategy: KeyStrategy
+): string {
   let out = "";
   for (const node of nodes) {
     switch (node.kind) {
@@ -169,10 +282,10 @@ export function generate(nodes: Node[], fromBindings: Map<string, FromActivateBi
         out += node.text;
         break;
       case "configuration":
-        out += generateConfiguration(node);
+        out += generateConfiguration(node, strategy);
         break;
       case "injectable":
-        out += generateInjectable(node);
+        out += generateInjectable(node, strategy);
         break;
       case "token":
         // 複数箇所（複数ファイルにまたがる場合も含む）から安定して参照
@@ -194,7 +307,7 @@ export function generate(nodes: Node[], fromBindings: Map<string, FromActivateBi
         out += generateOverrideEntryLines(node.entry).join("\n");
         break;
       case "standalone-bind":
-        out += generateBindEntryLines(node.entry).join("\n");
+        out += generateBindEntryLines(node.entry, strategy).join("\n");
         break;
     }
   }
