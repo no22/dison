@@ -161,6 +161,14 @@ override UserService {
 }
 ```
 
+An override targeting a base class also applies to instances of its
+subclasses (new in 1.3.0) — consistent with the fact that `injectable`
+properties are inherited. The most specific registration wins: if both
+`override Service` and `override SubService` set the same property, a
+`SubService` instance uses the latter. Across scopes the usual priority
+(local > class > global) is checked first, so a local override targeting
+a base class beats a global override targeting the subclass.
+
 `override` can also be written standalone (not wrapped in a
 `configuration`), which desugars to an immediate assignment — useful
 inside a function to capture a lexical variable:
