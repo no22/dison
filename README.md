@@ -148,24 +148,50 @@ and can be written standalone or inside a `configuration`, same as
 
 ### `token`
 
-Disambiguates `bind`/`injectable` when the same interface or type
-alias name exists in more than one file:
+Most name clashes are resolved automatically (see *Automatic collision
+resolution* below), so you rarely need this. `token` is the explicit
+escape hatch for the one case Dison can't handle on its own: the same
+interface or type-alias name coming from two *different external npm
+packages*. Those types are declared outside your project, so Dison
+can't attach a companion to them.
 
 ```dison
 token RepoToken;
 
 class S {
-  injectable dep: IRepository as RepoToken = new Impl();
+  injectable dep: SomePkgRepository as RepoToken = new Impl();
 }
 
 configuration Cfg {
-  bind IRepository as RepoToken = Mock;
+  bind SomePkgRepository as RepoToken = Mock;
 }
 ```
 
-If two files each declare their own `IRepository` interface and both
-are used in `bind`/`injectable` without a token, the CLI reports a
-build error instead of silently letting one collide with the other.
+When such an unresolvable clash is detected, the CLI reports a build
+error telling you to add a `token` / `as <token>`, rather than
+silently letting one type collide with the other. An explicit token
+also always wins if you want to override the automatic keying.
+
+## Automatic collision resolution
+
+`bind`/`injectable` match types by identity, not by name, so
+same-named types in different files never collide — no tokens, no
+coordination:
+
+- **Classes** (concrete or `abstract`) are keyed by the class value
+  itself, the same way `override` keys on the class. Two unrelated
+  `class Foo` in two files are distinct runtime values.
+- **Interfaces / type aliases** have no runtime value, so Dison
+  generates a companion `Symbol` per declaration and keys on that.
+  When you use such a type from another file, Dison injects the
+  matching companion import automatically (it emits companions only
+  for types actually used in DI).
+
+So two files can each declare their own `IRepository` and use it in
+`bind`/`injectable` with no ceremony; each module's `bind` only affects
+its own. See [`sample/multi-file-collision/`](sample/multi-file-collision/).
+The only clash Dison can't resolve this way is between types from two
+different external packages — that's what [`token`](#token) is for.
 
 ## Multiple files
 
@@ -186,8 +212,9 @@ and share a common `node_modules` ancestor, which is the normal case).
 
 See [`sample/`](sample/) for runnable, self-contained examples covering
 `injectable`/`override`/`activate`, `bind` (including generics and
-chaining), and a multi-file project using `token` to disambiguate
-same-named interfaces across files.
+chaining), and a multi-file project where two files declare their own
+same-named `IRepository` interface and Dison keeps them apart
+automatically — no tokens needed.
 
 ## License
 

@@ -1,5 +1,0 @@
-// Shared tokens used by user-module.dis and admin-module.dis to
-// disambiguate their two independent (and same-named!) IRepository
-// interfaces from one another. See ../README.md for context.
-token UserRepoToken;
-token AdminRepoToken;

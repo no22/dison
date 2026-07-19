@@ -33,16 +33,23 @@ npx dison sample/02-bind-and-generics.dis
 npx tsx sample/02-bind-and-generics.ts
 ```
 
-## multi-file-token/
+## multi-file-collision/
 
-A 4-file project (`tokens.dis`, `user-module.dis`, `admin-module.dis`,
-`main.dis`) demonstrating cross-file dependency injection and the
-`token` / `as <token>` syntax. `user-module.dis` and `admin-module.dis`
-each declare their own, unrelated `IRepository` interface — the same
-name, in two different files. Without tokens this would be a genuine
-naming collision that the CLI refuses to build (see the comment in
-`user-module.dis`); tokens let both modules use `IRepository` safely
-side by side.
+A 3-file project (`user-module.dis`, `admin-module.dis`, `main.dis`)
+demonstrating cross-file dependency injection and **automatic
+collision resolution**. `user-module.dis` and `admin-module.dis` each
+declare their own, unrelated `IRepository` interface — the same name,
+in two different files — with **no tokens and no coordination** between
+them. Each module's `bind` only affects its own `IRepository`.
+
+Dison handles this automatically: every interface/type-alias
+declaration gets its own generated companion `Symbol`, so two
+same-named interfaces are distinct keys at runtime and never collide
+across files. (Concrete classes work the same way, keyed by the class
+value itself.) You only need the explicit `token` / `as <token>`
+syntax when the clashing types come from two *different external npm
+packages*, which Dison can't generate companions for — see the `token`
+section in the top-level README.
 
 This example needs `@no22/dison` itself installed as a dependency,
 since the generated files import their shared runtime from
@@ -51,8 +58,8 @@ the Dison repo itself, `npm link` (once, globally) and then
 `npm link @no22/dison` (in this repo) sets that up.
 
 ```bash
-npx dison sample/multi-file-token/tokens.dis sample/multi-file-token/user-module.dis sample/multi-file-token/admin-module.dis sample/multi-file-token/main.dis
-npx tsx sample/multi-file-token/main.ts
+npx dison sample/multi-file-collision/user-module.dis sample/multi-file-collision/admin-module.dis sample/multi-file-collision/main.dis
+npx tsx sample/multi-file-collision/main.ts
 ```
 
 Expected output:

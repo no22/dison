@@ -1,11 +1,11 @@
-import { UserRepoToken } from "./tokens";
-
 // This module declares its own IRepository — unaware that
 // admin-module.dis declares an unrelated interface with the exact
-// same name. If BOTH modules used a plain (untokened) IRepository,
-// the CLI's cross-file collision check would refuse to transpile the
-// project at all (try removing every "as ...Token" clause from both
-// this file and admin-module.dis to see the build error).
+// same name. No tokens, no coordination between the two modules.
+//
+// Dison resolves this automatically: each interface declaration gets
+// its own generated companion Symbol, so the two IRepository types are
+// distinct keys at runtime and never collide across files. (Concrete
+// classes are handled the same way, keyed by the class value itself.)
 export interface IRepository {
   whoAmI(): string;
 }
@@ -23,9 +23,9 @@ class MockUserRepository implements IRepository {
 }
 
 export class UserService {
-  injectable repo: IRepository as UserRepoToken = new SqlUserRepository();
+  injectable repo: IRepository = new SqlUserRepository();
 }
 
 configuration UseMockUserRepo {
-  bind IRepository as UserRepoToken = MockUserRepository;
+  bind IRepository = MockUserRepository;
 }

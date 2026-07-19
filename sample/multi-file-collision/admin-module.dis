@@ -1,8 +1,7 @@
-import { AdminRepoToken } from "./tokens";
-
 // A second, completely unrelated module that happens to declare its
-// own IRepository interface too. Thanks to the tokens, it never
-// collides with user-module.dis's IRepository.
+// own IRepository interface too. It never collides with
+// user-module.dis's IRepository — Dison keys each declaration by its
+// own companion Symbol, so no token or coordination is needed.
 export interface IRepository {
   whoAmI(): string;
 }
@@ -20,9 +19,9 @@ class MockAdminRepository implements IRepository {
 }
 
 export class AdminService {
-  injectable repo: IRepository as AdminRepoToken = new SqlAdminRepository();
+  injectable repo: IRepository = new SqlAdminRepository();
 }
 
 configuration UseMockAdminRepo {
-  bind IRepository as AdminRepoToken = MockAdminRepository;
+  bind IRepository = MockAdminRepository;
 }

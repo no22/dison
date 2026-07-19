@@ -1,6 +1,6 @@
 // Run this whole example:
-//   npx dison sample/multi-file-token/tokens.dis sample/multi-file-token/user-module.dis sample/multi-file-token/admin-module.dis sample/multi-file-token/main.dis
-//   npx tsx sample/multi-file-token/main.ts
+//   npx dison sample/multi-file-collision/user-module.dis sample/multi-file-collision/admin-module.dis sample/multi-file-collision/main.dis
+//   npx tsx sample/multi-file-collision/main.ts
 //
 // (@no22/dison must be installed as a dependency of this project, since
 // the generated files import their shared runtime from "@no22/dison/runtime".)
@@ -10,7 +10,8 @@ import { AdminService } from "./admin-module";
 
 // activate ... from "..." activates a configuration defined in
 // another file without you needing to know or import its generated
-// function name.
+// function name. Each module's bind only affects its own IRepository,
+// even though both interfaces share the same name.
 activate UseMockUserRepo from "./user-module";
 activate UseMockAdminRepo from "./admin-module";
 
