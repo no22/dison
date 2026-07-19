@@ -143,6 +143,18 @@ A dependency is wired according to the scope active where its *root*
 object was constructed, and the whole lazily-built object graph follows
 that same scope consistently.
 
+In an `async` function body, entering a local scope is an **implicit
+suspension point** (one microtask; new in 1.4.0). The configuration and
+the code after it run in the function's own async context, so the scope
+can never leak into the caller's code while the function is suspended
+at an `await`. Everything else behaves as before: the scope stays
+active across `await`s inside the function, concurrent async calls
+remain isolated, and instances constructed inside the scope keep it.
+Local configurations are rejected at transpile time inside **generator**
+function bodies (sync or async), because the scope cannot be kept
+across `yield` — put the configuration in the function that drives the
+generator instead.
+
 > Local scopes desugar to `using` + `AsyncLocalStorage`, so generated
 > code that uses them needs `Symbol.dispose` (TypeScript 5.2+ / Node 20+)
 > and `node:async_hooks` at runtime. See [Requirements](#requirements).
