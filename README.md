@@ -110,6 +110,25 @@ To activate a configuration defined in another file:
 activate TestConfig from "./configs";
 ```
 
+#### Forward references (new in 1.5.0)
+
+A configuration may reference classes declared **later in the same
+file** — key evaluation is deferred until the wiring is first consulted,
+so the natural "declarative header" style just works:
+
+```dison
+configuration { bind Repo = MockRepo; }   // at the top of the file
+
+class Repo { ... }
+class MockRepo extends Repo { ... }
+class Service { injectable repo: Repo; }
+```
+
+This applies to `bind`, `override`, class-body configurations, and
+`activate` alike. Registration *order* is still respected: if the same
+type is bound twice, the registration that executes later wins, exactly
+as if everything had been applied in place.
+
 #### Scoped configuration (new in 1.2.0)
 
 Where you write a `configuration` decides how far it reaches. An
