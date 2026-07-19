@@ -1,15 +1,19 @@
 import { transformSync } from "esbuild";
+import { createRequire } from "node:module";
 import { transpileDisonToTS } from "./core.js";
 
 // 生成されたTypeScriptを実際に実行してランタイム挙動を検証するためのヘルパー。
-// esbuildで型情報を取り除いてCommonJSとして実行する。生成コードは
-// import/requireを含まないため、moduleとexportsだけ渡せば十分。
+// esbuildで型情報を取り除いてCommonJSとして実行する。スコープ対応
+// （docs/scoped-configuration.md）でランタイムが "node:async_hooks" を import する
+// ため、esbuildのcjs変換後の require("node:async_hooks") を解決できるよう require を
+// 渡す。using（Symbol.dispose）も esbuild が down-level し、Node実行時に動作する。
+const nodeRequire = createRequire(import.meta.url);
 export function runGenerated(disonSource: string): any {
   const ts = transpileDisonToTS(disonSource);
-  const { code } = transformSync(ts, { loader: "ts", format: "cjs" });
+  const { code } = transformSync(ts, { loader: "ts", format: "cjs", target: "node20" });
   const mod: { exports: any } = { exports: {} };
-  const fn = new Function("module", "exports", code);
-  fn(mod, mod.exports);
+  const fn = new Function("module", "exports", "require", code);
+  fn(mod, mod.exports, nodeRequire);
   return mod.exports;
 }
 

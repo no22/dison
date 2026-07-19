@@ -249,7 +249,7 @@ import {
   type KeyStrategy,
   type CompanionImport,
 } from "./codegen.js";
-import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE } from "./runtime.js";
+import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE, DISON_RUNTIME_IMPORTS } from "./runtime.js";
 import { findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
 import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo } from "./collisions.js";
 
@@ -339,12 +339,16 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
     }
   }
 
+  // スコープ対応（docs/scoped-configuration.md）で AsyncLocalStorage を使うため、
+  // ランタイムの import を生成物の先頭に置く。単一ファイル（インライン）モードでも
+  // ランタイム宣言が als を参照するので、この import が必要。
   const header = `// --- Auto-generated TypeScript code ---\n\n`;
   const prelude = options.runtimeModulePath
-    ? `${header}import {\n` +
-      `  DI_REGISTRY,\n  TYPE_BINDINGS,\n  bindType,\n  resolveType,\n  registerOverride,\n  getOverride,\n` +
+    ? `${header}${DISON_RUNTIME_IMPORTS}import {\n` +
+      `  bindType,\n  resolveType,\n  registerOverride,\n` +
+      `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScope,\n  __disonBuildFrame,\n` +
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
-    : `${header}${generateRuntimeDeclarations("")}\n`;
+    : `${header}${DISON_RUNTIME_IMPORTS}\n${generateRuntimeDeclarations("")}\n`;
 
   // ES Modules の import はファイル先頭にしか書けないため、import 系（companion import、
   // "activate ... from" の import）を前置きの直後にまとめて出す。companion の const 宣言

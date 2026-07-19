@@ -150,6 +150,9 @@ export class Parser {
   // （looksLikeInjectable/looksLikeActivateと同じパターン）。
   private looksLikeConfiguration(): boolean {
     const a = this.peekSignificant(1);
+    // 名前付き "configuration IDENT {" または無名 "configuration {"
+    // （無名は auto-active。docs/scoped-configuration.md）。
+    if (a.type === "punct" && a.text === "{") return true;
     const b = this.peekSignificant(2);
     return a.type === "ident" && b.type === "punct" && b.text === "{";
   }
@@ -487,24 +490,35 @@ export class Parser {
   }
 
   private parseConfiguration(): Node {
-    // configuration は function 宣言を生成するため、また「定義済み
-    // configuration名」という静的な前提（activateのタイプミス検出、5節参照）
-    // を壊さないため、トップレベルにのみ書ける。
-    if (!this.blockContext.isTopLevel(this.pos)) {
-      throw new DisonParseError(
-        `"configuration" can only be placed at the top level (not inside a function or class). If you just want a standalone override/bind at this spot, write it without wrapping it in a configuration.`,
-        this.peek().pos
-      );
-    }
+    // 構文位置でスコープレベルを決める（docs/scoped-configuration.md）:
+    //   - トップレベル → "global"（名前付きは activate 関数、無名は即時グローバル適用）
+    //   - クラス本体の直下 → "class"（無名のみ。static __dison_classScope に脱糖）
+    //   - それ以外（関数/メソッド本体） → "local"（無名のみ。using で脱糖）
+    const configPos = this.pos;
+    const scope: "global" | "local" | "class" = this.blockContext.isTopLevel(configPos)
+      ? "global"
+      : this.blockContext.isDirectClassBodyChild(configPos)
+      ? "class"
+      : "local";
+
     const startTok = this.next(); // 'configuration'
     this.skipTrivia();
-    const nameTok = this.peek();
-    if (nameTok.type !== "ident") {
-      throw new DisonParseError(`Expected a configuration name but found "${nameTok.text}"`, nameTok.pos);
+    // 名前は任意。無名（次が "{"）なら auto-active。
+    let name: string | undefined;
+    if (this.peek().type === "ident") {
+      name = this.next().text;
+      this.skipTrivia();
     }
-    const name = this.next().text;
-    this.skipTrivia();
-    this.expectPunct("{", `configuration "${name}"`);
+    // フェーズ1/2: 名前付きローカル/クラス configuration（+ その activate）は未対応。
+    if (scope !== "global" && name !== undefined) {
+      const where = scope === "class" ? "class body" : "function/method";
+      throw new DisonParseError(
+        `A named "configuration ${name}" inside a ${where} is not supported yet. Use an anonymous "configuration { ... }" here, or define it at the top level.`,
+        startTok.pos
+      );
+    }
+    const label = name !== undefined ? `configuration "${name}"` : `anonymous configuration`;
+    this.expectPunct("{", label);
 
     const entries: ConfigEntry[] = [];
 
@@ -516,23 +530,23 @@ export class Parser {
         break;
       }
       if (t.type === "eof") {
-        throw new DisonParseError(`Closing "}" for configuration "${name}" not found`, startTok.pos);
+        throw new DisonParseError(`Closing "}" for ${label} not found`, startTok.pos);
       }
       if (t.type === "keyword" && t.text === "override") {
-        entries.push(this.parseOverride(`configuration "${name}"`));
+        entries.push(this.parseOverride(label));
         continue;
       }
       if (t.type === "keyword" && t.text === "bind") {
-        entries.push(this.parseBind(`configuration "${name}"`));
+        entries.push(this.parseBind(label));
         continue;
       }
       throw new DisonParseError(
-        `Only override / bind declarations are allowed inside configuration "${name}" (found "${t.text}")`,
+        `Only override / bind declarations are allowed inside ${label} (found "${t.text}")`,
         t.pos
       );
     }
 
-    return { kind: "configuration", name, entries };
+    return { kind: "configuration", name, scope, entries };
   }
 
   // context: エラーメッセージに埋め込む文脈の説明。configuration内で呼ばれる

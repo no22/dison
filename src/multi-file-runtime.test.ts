@@ -2,19 +2,24 @@ import { describe, it, expect } from "vitest";
 import { transpileDisonToTS, DISON_RUNTIME_MODULE_SOURCE } from "./core";
 
 describe("複数ファイル対応フェーズ1（docs/multi-file-support.md）", () => {
-  it("既定（オプション省略）では従来通りランタイムをインライン生成する", () => {
+  it("既定（オプション省略）ではランタイムをインライン生成する", () => {
     const out = transpileDisonToTS(`class Foo {}\nclass S { injectable dep: Foo; }`);
+    // ランタイムの宣言本体がインラインされる（関数定義がある）。
     expect(out).toContain("const DI_REGISTRY = new WeakMap");
-    expect(out).not.toContain("import {");
+    expect(out).toContain("function __disonEnterScope");
+    // スコープ対応で AsyncLocalStorage の import は付くが、ランタイム本体を別モジュールから
+    // import はしない。
+    expect(out).toContain('import { AsyncLocalStorage } from "node:async_hooks";');
+    expect(out).not.toMatch(/} from "\.\//);
   });
 
-  it("runtimeModulePathを指定すると、インライン生成の代わりにimport文になる", () => {
+  it("runtimeModulePathを指定すると、ランタイム本体はインラインせずそのパスからimportする", () => {
     const out = transpileDisonToTS(`class Foo {}\nclass S { injectable dep: Foo; }`, {
       runtimeModulePath: "./dison-runtime",
     });
     expect(out).toContain('} from "./dison-runtime";');
-    expect(out).toContain("DI_REGISTRY");
     expect(out).toContain("registerOverride");
+    expect(out).toContain("__disonResolveInjectable");
     expect(out).not.toContain("const DI_REGISTRY = new WeakMap");
   });
 

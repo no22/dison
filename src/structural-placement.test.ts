@@ -14,16 +14,30 @@ describe("構造的な位置制約", () => {
     );
   });
 
-  it("configurationはトップレベルでなければパースエラーになる（関数の中）", () => {
-    expect(() => transpileDisonToTS(`function f() { configuration Cfg { bind A = B; } } `)).toThrow(
-      /can only be placed at the top level/
+  it("無名configurationは関数の中に書ける（ローカルスコープ、docs/scoped-configuration.md）", () => {
+    // 非トップレベルの無名 configuration は using で脱糖されるローカルスコープになる。
+    const out = transpileDisonToTS(`class A {}\nclass B extends A {}\nfunction f() { configuration { bind A = B; } }`);
+    expect(out).toContain("using __dison_scope_0 = __disonEnterScope(");
+    expect(out).toContain("__disonBind(A,");
+  });
+
+  it("名前付きローカルconfigurationは未対応でパースエラーになる", () => {
+    expect(() => transpileDisonToTS(`function f() { configuration Cfg { bind A = B; } }`)).toThrow(
+      /not supported yet/
     );
   });
 
-  it("configurationはトップレベルでなければパースエラーになる（クラスの中）", () => {
+  it("無名configurationはクラス本体の直下に書ける（クラススコープ、docs/scoped-configuration.md フェーズ2）", () => {
+    // クラス本体直下の無名 configuration は static __dison_classScope に脱糖される。
+    const out = transpileDisonToTS(`class A {}\nclass B extends A {}\nclass S { injectable a: A; configuration { bind A = B; } }`);
+    expect(out).toContain("static __dison_classScope_0 = __disonBuildFrame(");
+    expect(out).toContain("__disonBind(A,");
+  });
+
+  it("名前付きクラスconfigurationは未対応でパースエラーになる", () => {
     expect(() =>
-      transpileDisonToTS(`class S { m() { configuration Cfg { bind A = B; } } }`)
-    ).toThrow(/can only be placed at the top level/);
+      transpileDisonToTS(`class S { configuration Cfg { bind A = B; } }`)
+    ).toThrow(/not supported yet/);
   });
 
   it("単独のoverrideはクラス本体の直下には書けない（メソッドの外）", () => {

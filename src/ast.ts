@@ -35,7 +35,14 @@ export type ConfigEntry = OverrideEntry | BindEntry;
 
 export type Node =
   | { kind: "raw"; text: string }
-  | { kind: "configuration"; name: string; entries: ConfigEntry[] }
+  // configuration: name が undefined なら無名（auto-active、宣言的。
+  // docs/scoped-configuration.md）。scope は構文位置で決まるレベル:
+  //   - "global": トップレベル。名前付きは activate 関数、無名は即時グローバル適用。
+  //   - "local": 関数/メソッド本体。無名のみ（フェーズ1）で、`using ... __disonEnterScope(...)`
+  //     に脱糖されレキシカルなスコープに閉じる。
+  //   - "class": クラス本体直下。無名のみ（フェーズ2）で、`static __dison_classScope_N =
+  //     __disonBuildFrame(...)` に脱糖され、そのクラスのインスタンスの解決に効く。
+  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; entries: ConfigEntry[] }
   // token: "injectable prop: Type as Token = ...;" のas句（bindと同じ役割）。
   | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string }
   // token Name; -> export const Name = Symbol("Name"); に脱糖される

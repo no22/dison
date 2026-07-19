@@ -52,13 +52,16 @@ function keyExprFor(typeKey: string, token: string | undefined, strategy: KeyStr
 // override 1件分のDI_REGISTRY代入文を生成する。configuration内（関数本体に
 // 収集される場合）と、configurationで包まない単独のoverride（その場に直接
 // 出力される場合）の両方から共有される。
-function generateOverrideEntryLines(entry: OverrideEntry): string[] {
+// local=false: グローバルレジストリへ登録（registerOverride）。local=true: ローカル
+// スコープフレームへ登録（__disonOverride。__disonEnterScope の setup 内で使う）。
+function generateOverrideEntryLines(entry: OverrideEntry, local: boolean): string[] {
   // entry.className はクラスの実体を指す識別子としてそのまま埋め込む
-  // （文字列リテラルにはしない）。registerOverride がクラスの実体そのものを
-  // キーにするため、className がスコープ内に存在しない（タイプミス・
-  // importし忘れ）場合は tsc が "Cannot find name" として検出する。
+  // （文字列リテラルにはしない）。キーがクラスの実体そのものなので、className が
+  // スコープ内に存在しない（タイプミス・importし忘れ）場合は tsc が "Cannot find name"
+  // として検出する。
+  const fn = local ? "__disonOverride" : "registerOverride";
   return entry.assignments.map(
-    (a) => `  registerOverride(${entry.className}, "${a.prop}", () => (${a.valueExpr}));`
+    (a) => `  ${fn}(${entry.className}, "${a.prop}", () => (${a.valueExpr}));`
   );
 }
 
@@ -88,7 +91,12 @@ function generateOverrideEntryLines(entry: OverrideEntry): string[] {
 // 連鎖: 差し替え先クラス自身がさらに bind されている可能性があるので、
 // 直接 new せず resolveType を介して再帰的に解決する。
 // （bind A = B; bind B = C; と書けば、Aの解決は最終的にCまで辿る）
-function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy): string[] {
+// local=false: グローバル TYPE_BINDINGS へ登録（bindType<T>）。local=true: ローカル
+// スコープフレームへ登録（__disonBind。__disonEnterScope の setup 内で使う）。
+// bindType<T> は型引数で差し替え先の型互換を tsc に検査させるが、__disonBind は
+// 型引数を取れないため、代わりに factory の返り値型注釈 `(): OrigType =>` で同じ検査を
+// 得る（差し替え先が OrigType と非互換なら tsc がエラーにする）。
+function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy, local: boolean): string[] {
   const originalKeyExpr = keyExprFor(entry.originalTypeKey, entry.token, strategy);
   // 差し替え先（replacement）は `new` で実体化される具象クラスなので、それ自身が
   // さらに bind の左辺になっている場合の連鎖解決キーも、左辺と同じ規則で決める
@@ -96,30 +104,62 @@ function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy): string
   // ことで、ある型が「bindの左辺」と「別のbindの差し替え先」の両方に現れてもキーが一致する。
   const replacementKeyExpr = keyExprFor(entry.replacementTypeKey, undefined, strategy);
   // "bind Original = Replacement(args)" のコンストラクタ引数（あれば）を new 式に渡す。
-  // 引数は tsc が Replacement のコンストラクタ型で検査する（docs/bind-constructor-arguments.md）。
   const args = entry.replacementArgs ?? "";
+  const factory = `resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}(${args}))`;
   return [
-    `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}(${args})));`,
+    local
+      ? `  __disonBind(${originalKeyExpr}, (): ${entry.originalTypeName} => ${factory});`
+      : `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => ${factory});`,
   ];
 }
 
+// configuration を構文位置に応じて生成する（docs/scoped-configuration.md）:
+//   - local（関数/メソッド本体・無名）: `using __dison_scope_N = __disonEnterScope(...)` に
+//     脱糖。囲みブロックの終端で自動的に元のスコープへ戻る（Symbol.dispose）。
+//   - class（クラス本体直下・無名）: `static __dison_classScope_N = __disonBuildFrame(...)` に
+//     脱糖。そのクラス（のインスタンス）の解決チェインに入る（プロトタイプ鎖で継承される）。
+//   - global 名前付き: `export function activateName() {...}`（activate で有効化）。
+//   - global 無名: auto-active。即時にグローバルへ適用する呼び出しをその場に出す。
+// scopeId は複数の local/class configがあっても衝突しない連番（class は static フィールド名の
+// 一意性に、local は using 変数名の一意性に使う）。
 function generateConfiguration(
   node: Extract<Node, { kind: "configuration" }>,
-  strategy: KeyStrategy
+  strategy: KeyStrategy,
+  scopeId: number
 ): string {
+  // local と class は「フレームへ差分を積む」形（__disonBind/__disonOverride）を共有する。
+  const frameForm = node.scope === "local" || node.scope === "class";
   const lines: string[] = [];
   for (const entry of node.entries) {
     if (entry.kind === "override") {
-      lines.push(...generateOverrideEntryLines(entry));
+      lines.push(...generateOverrideEntryLines(entry, frameForm));
     } else {
-      lines.push(...generateBindEntryLines(entry, strategy));
+      lines.push(...generateBindEntryLines(entry, strategy, frameForm));
     }
   }
-  // export しておくことで、他ファイルから import { activateName } して
-  // activate をクロスファイルで使えるようにする（docs/multi-file-support.md
-  // フェーズ1。単一ファイル利用時もexportは無害で、同一ファイル内から
-  // 従来通り呼び出せる）。
-  return `export function activate${node.name}() {\n${lines.join("\n")}\n}`;
+  if (node.scope === "local") {
+    // 無名ローカル configuration。__disonEnterScope の setup で __disonBind/__disonOverride を
+    // 使ってフレームへ差分を積む。`using` で受けるのでブロック終端で自動的に戻る。
+    return (
+      `using __dison_scope_${scopeId} = __disonEnterScope((__disonBind, __disonOverride) => {\n` +
+      `${lines.join("\n")}\n});`
+    );
+  }
+  if (node.scope === "class") {
+    // 無名クラス configuration。クラス本体の static フィールドとしてフレームを構築する。
+    // __disonClassScopes が this.constructor のプロトタイプ鎖からこの static を集める。
+    return (
+      `static __dison_classScope_${scopeId} = __disonBuildFrame((__disonBind, __disonOverride) => {\n` +
+      `${lines.join("\n")}\n});`
+    );
+  }
+  if (node.name !== undefined) {
+    // 名前付きグローバル。export しておくと他ファイルから import して activate できる
+    // （docs/multi-file-support.md フェーズ1）。単一ファイルでもexportは無害。
+    return `export function activate${node.name}() {\n${lines.join("\n")}\n}`;
+  }
+  // 無名グローバル: auto-active。その場に即時適用する呼び出しを出す。
+  return lines.join("\n");
 }
 
 function generateInjectable(
@@ -147,17 +187,22 @@ function generateInjectable(
   const keyExpr = keyExprFor(k, token, strategy);
   const fallback = simpleShape ? `resolveType(${keyExpr}, () => ${finalDefault})` : finalDefault;
 
+  // 構築時にその時点のスコープ（ローカルフレーム、無ければグローバル）を捕捉する
+  // （docs/scoped-configuration.md フェーズ1）。__disonResolveInjectable が解決時に
+  // このスコープへ再突入し、override > fallback（bind/既定初期化式）の順で解決する。
+  // 再突入により、fallback 内で遅延構築される依存の new も同じスコープの下で走る。
+  // 捕捉フィールドは injectable ごとに1つ（同じ値だが重複宣言を避けるため名前を分ける）。
+  //
   // strictモードでは `if (!this._x) { this._x = f(); }` の後の `return this._x;` は
-  // 途中で挟まる関数呼び出し（factory()）によりnarrowingが無効化され、
-  // `T | undefined` のままとみなされてコンパイルエラーになる。
-  // そのためローカル変数を経由して確実に非undefined型として返す。
+  // 途中で挟まる関数呼び出しによりnarrowingが無効化され `T | undefined` とみなされて
+  // コンパイルエラーになる。そのため末尾で `!` を付けて確実に非undefined型として返す。
   return [
     ``,
+    `  private readonly __dison_scope_${p} = __disonCurrentScope();`,
     `  private _${p}?: ${t};`,
     `  get ${p}(): ${t} {`,
     `    if (!this._${p}) {`,
-    `      const factory = getOverride(this.constructor, "${p}");`,
-    `      this._${p} = factory ? factory() : ${fallback};`,
+    `      this._${p} = __disonResolveInjectable(this.__dison_scope_${p}, this.constructor, "${p}", () => ${fallback});`,
     `    }`,
     `    return this._${p}!;`,
     `  }`,
@@ -279,13 +324,19 @@ export function generate(
   strategy: KeyStrategy
 ): string {
   let out = "";
+  // local/class 無名 configuration の連番（using 変数名 / static フィールド名の衝突回避）。
+  let scopeCounter = 0;
   for (const node of nodes) {
     switch (node.kind) {
       case "raw":
         out += node.text;
         break;
       case "configuration":
-        out += generateConfiguration(node, strategy);
+        out += generateConfiguration(
+          node,
+          strategy,
+          node.scope === "local" || node.scope === "class" ? scopeCounter++ : -1
+        );
         break;
       case "injectable":
         out += generateInjectable(node, strategy);
@@ -305,12 +356,12 @@ export function generate(
         }
         break;
       case "standalone-override":
-        // configurationで包まないため関数宣言にせず、その場に直接
+        // configurationで包まないため関数宣言にせず、その場に直接グローバルへの
         // 代入文として出力する（書かれた位置で即座に実行される）。
-        out += generateOverrideEntryLines(node.entry).join("\n");
+        out += generateOverrideEntryLines(node.entry, false).join("\n");
         break;
       case "standalone-bind":
-        out += generateBindEntryLines(node.entry, strategy).join("\n");
+        out += generateBindEntryLines(node.entry, strategy, false).join("\n");
         break;
     }
   }

@@ -1,95 +1,188 @@
 // =====================================================================
 // 共有ランタイムの前置き生成
 // =====================================================================
+//
+// ランタイムの宣言部分を生成する。exportKeyword に "export " を渡すと各宣言が
+// exportされる（複数ファイルで共有するランタイムモジュールとして使う場合）。
+// 単一ファイルでインライン生成する場合は ""（空文字）を渡す。
+//
+// DI_REGISTRY（override用）/TYPE_BINDINGS（bind用）はグローバルな束縛レジストリ。
+// クラスは実体（Function）、interface/型エイリアスは companion Symbol または文字列、
+// as トークンはそのSymbolをキーにする（docs/type-identity-matching.md、
+// docs/bind-interface-token.md）。
+//
+// スコープ対応（docs/scoped-configuration.md フェーズ1）: 非トップレベルの
+// configuration はローカルスコープ（レキシカルなブロック）に閉じる。AsyncLocalStorage
+// で現在のスコープフレーム（束縛の差分＋親フレーム）を持ち、getOverride/resolveType は
+// 「現在のフレーム鎖（内→外）→ グローバル」の順に解決する。injectable は構築時に
+// 現在のフレームを捕捉し、解決時にそのフレームへ再突入する（遅延構築される依存グラフ
+// 全体が root の構築スコープに一貫して従う）。ローカルスコープは `using` 宣言で入り、
+// 囲みブロックの終端で自動的に元に戻る（Symbol.dispose）。
 
-// ランタイムの宣言部分（DI_REGISTRY/TYPE_BINDINGS/bindType/resolveType/
-// registerOverride/getOverride）を生成する。exportKeyword に "export " を渡すと
-// 各宣言がexportされる（複数ファイルで共有するランタイムモジュールとして使う
-// 場合）。単一ファイルでインライン生成する場合は ""（空文字）を渡す。
-//
-// DI_REGISTRY（override用）はクラス名の文字列ではなく、クラスの実体そのものを
-// キーにする（WeakMap<Function, ...>）。理由:
-//   - override対象のクラス名が実際にスコープ内に存在するか（importし忘れ・
-//     タイプミスがないか）をtsc自身が「名前が見つからない」エラーとして
-//     検出できるようになる（従来は文字列一致だったため、タイプミスしても
-//     一切検出されずDI_REGISTRY["Typo"]という誰も参照しないエントリを
-//     静かに作るだけだった）。
-//   - 複数ファイルにまたがって同名クラスが存在しても、参照そのものが
-//     キーになるため衝突しない（docs/multi-file-support.md参照）。
-//
-// TYPE_BINDINGS（bind用）のキーは、型が具象クラスなら実体参照（Function）、
-// それ以外（interface/型エイリアス/ジェネリクス）なら型名の文字列を使う。
-// 具象クラスの実体キー化はDI_REGISTRYと同じ発想で、複数ファイルにまたがる
-// 同名クラスが衝突しなくなる（手動tokenなしで自動的に別の実体として区別される。
-// どの型を実体キーにするかの判定はcodegen/collisionsが担う。
-// docs/type-identity-matching.md）。bindの左辺がinterface/型エイリアスの場合は
-// 実行時に値が無いため実体参照できず、文字列キーのまま。複数ファイルに
-// またがる同名interface/型エイリアスの衝突は "as <トークン>" で回避する
-// （docs/bind-interface-token.md）。
+// スコープ対応に必要な import（AsyncLocalStorage）。生成物のファイル先頭に置く必要が
+// あるため、宣言本体（generateRuntimeDeclarations）とは分けて提供する。単一ファイル
+// モードでは core.ts が、複数ファイルモードでは共有ランタイムモジュールが先頭に付ける。
+export const DISON_RUNTIME_IMPORTS = `import { AsyncLocalStorage } from "node:async_hooks";\n`;
+
 export function generateRuntimeDeclarations(exportKeyword: "" | "export "): string {
+  const E = exportKeyword;
   return (
-    `// Global dependency registry (per-property override).\n` +
-    `// Keying on the class itself (not its name) lets tsc catch a typo in the\n` +
-    `// override target class name as a "Cannot find name" error.\n` +
-    `${exportKeyword}const DI_REGISTRY = new WeakMap<Function, Record<string, () => any>>();\n\n` +
-    `${exportKeyword}function registerOverride(cls: Function, prop: string, factory: () => any): void {\n` +
-    `  let entry = DI_REGISTRY.get(cls);\n` +
-    `  if (!entry) {\n` +
-    `    entry = {};\n` +
-    `    DI_REGISTRY.set(cls, entry);\n` +
+    `// --- scope infrastructure (docs/scoped-configuration.md) ---\n` +
+    `type __DisonFactory = () => any;\n` +
+    `type __DisonKey = string | symbol | Function;\n` +
+    `interface __DisonFrame {\n` +
+    `  binds: Map<__DisonKey, __DisonFactory>;\n` +
+    `  overrides: WeakMap<Function, Record<string, __DisonFactory>>;\n` +
+    `  parent: __DisonFrame | undefined;\n` +
+    `}\n` +
+    `${E}const __dison_als = new AsyncLocalStorage<__DisonFrame | undefined>();\n` +
+    `// Current scope frame (undefined = global only). Captured by injectable at construction.\n` +
+    `${E}function __disonCurrentScope(): __DisonFrame | undefined { return __dison_als.getStore(); }\n\n` +
+    `// Class scopes (an anonymous configuration directly inside a class body).\n` +
+    `// Unlike local scopes (als), a class scope is a static context that is only active\n` +
+    `// while resolving an instance of that class, so it is kept in a synchronous module\n` +
+    `// variable (not in als, so a dependency doesn't wrongly capture its parent's class\n` +
+    `// scope). __disonResolveInjectable sets it for the duration of a resolution and\n` +
+    `// restores it afterwards (correct nesting because resolution is synchronous). It stays\n` +
+    `// set throughout a resolution, so bind chains inside a class scope are followed too.\n` +
+    `let __dison_classScopeCtx: __DisonFrame[] | undefined;\n` +
+    `// A class-body configuration is placed as a static __dison_classScope_N field. Walk\n` +
+    `// this.constructor's prototype chain (child -> parent) and collect the fields each class\n` +
+    `// owns (inheritance: a subclass inherits its parent's class scope and can override just\n` +
+    `// the delta).\n` +
+    `function __disonClassScopes(cls: Function): __DisonFrame[] {\n` +
+    `  const out: __DisonFrame[] = [];\n` +
+    `  for (let c: any = cls; c && c !== Function.prototype && c !== Object; c = Object.getPrototypeOf(c)) {\n` +
+    `    for (const key of Object.getOwnPropertyNames(c)) {\n` +
+    `      if (key.indexOf('__dison_classScope') === 0) out.push(c[key]);\n` +
+    `    }\n` +
     `  }\n` +
+    `  return out;\n` +
+    `}\n` +
+    `// Build a frame without entering it (used to initialize a class body static field).\n` +
+    `${E}function __disonBuildFrame(\n` +
+    `  setup: (bind: (key: __DisonKey, factory: __DisonFactory) => void, override: (cls: Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): __DisonFrame {\n` +
+    `  const frame: __DisonFrame = { binds: new Map(), overrides: new WeakMap(), parent: undefined };\n` +
+    `  setup(\n` +
+    `    (key, factory) => { frame.binds.set(key, factory); },\n` +
+    `    (cls, prop, factory) => {\n` +
+    `      let e = frame.overrides.get(cls);\n` +
+    `      if (!e) { e = {}; frame.overrides.set(cls, e); }\n` +
+    `      e[prop] = factory;\n` +
+    `    }\n` +
+    `  );\n` +
+    `  return frame;\n` +
+    `}\n\n` +
+    `// --- global registries ---\n` +
+    `// Global dependency registry (per-property override). Keyed by the class itself\n` +
+    `// so tsc catches a typo in the override target class name.\n` +
+    `${E}const DI_REGISTRY = new WeakMap<Function, Record<string, __DisonFactory>>();\n\n` +
+    `${E}function registerOverride(cls: Function, prop: string, factory: __DisonFactory): void {\n` +
+    `  let entry = DI_REGISTRY.get(cls);\n` +
+    `  if (!entry) { entry = {}; DI_REGISTRY.set(cls, entry); }\n` +
     `  entry[prop] = factory;\n` +
     `}\n\n` +
-    `${exportKeyword}function getOverride(cls: Function, prop: string): (() => any) | undefined {\n` +
+    `// Look up an override in order: local frame chain (inner->outer) -> class scopes\n` +
+    `// (child->parent) -> global (priority: local > class > global).\n` +
+    `${E}function getOverride(cls: Function, prop: string): __DisonFactory | undefined {\n` +
+    `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
+    `    const o = f.overrides.get(cls);\n` +
+    `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop];\n` +
+    `  }\n` +
+    `  if (__dison_classScopeCtx) for (const f of __dison_classScopeCtx) {\n` +
+    `    const o = f.overrides.get(cls);\n` +
+    `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop];\n` +
+    `  }\n` +
     `  return DI_REGISTRY.get(cls)?.[prop];\n` +
     `}\n\n` +
-    `// Global type-replacement registry (bind).\n` +
-    `// The key is one of:\n` +
-    `//   - The class itself (Function). When a bind/injectable type is a concrete\n` +
-    `//     class, the class value (not its name string) is used as the key (same\n` +
-    `//     idea as DI_REGISTRY). Same-named classes across files no longer collide\n` +
-    `//     as a result (no manual token needed; with string keys, unrelated\n` +
-    `//     same-named classes used to pollute each other).\n` +
-    `//   - A type-name string. Used for interfaces/type aliases (no runtime value)\n` +
-    `//     and generics with concrete type arguments (Repository<User>).\n` +
-    `//   - A Symbol explicitly given via an "as <token>" clause (to avoid collisions\n` +
-    `//     between same-named interfaces/type aliases across files. docs/bind-interface-token.md).\n` +
-    `${exportKeyword}const TYPE_BINDINGS = new Map<string | symbol | Function, () => any>();\n` +
-    `const _resolvingTypeBindings = new Set<string | symbol | Function>();\n\n` +
-    `// bindType<T> takes T as an explicit type argument, so tsc raises a\n` +
-    `// compile error if the replacement factory isn't compatible with the\n` +
-    `// original type. T may be an interface or type alias (used only as a\n` +
-    `// type argument).\n` +
-    `${exportKeyword}function bindType<T>(typeKey: string | symbol | Function, factory: () => T): void {\n` +
+    `// Global type-replacement registry (bind). Key: class value (concrete class),\n` +
+    `// companion/token Symbol, or type-name string. See docs/type-identity-matching.md.\n` +
+    `${E}const TYPE_BINDINGS = new Map<__DisonKey, __DisonFactory>();\n` +
+    `const _resolvingTypeBindings = new Set<__DisonKey>();\n\n` +
+    `// bindType<T> takes T as an explicit type argument, so tsc raises a compile error\n` +
+    `// if the replacement factory isn't compatible with the original type.\n` +
+    `${E}function bindType<T>(typeKey: __DisonKey, factory: () => T): void {\n` +
     `  TYPE_BINDINGS.set(typeKey, factory);\n` +
     `}\n\n` +
-    `// Resolves a value by recursively walking TYPE_BINDINGS. bind chains\n` +
-    `// (e.g. bind A = B; bind B = C; makes resolving A eventually reach C).\n` +
-    `// A cycle (A -> B -> A) raises a clear error instead of a stack overflow.\n` +
-    `${exportKeyword}function resolveType<T>(typeKey: string | symbol | Function, defaultFactory: () => T): T {\n` +
-    `  const bound = TYPE_BINDINGS.get(typeKey);\n` +
+    `// Look up a bind in order: local frame chain (inner->outer) -> class scopes (child->parent)\n` +
+    `// -> global. __dison_classScopeCtx stays set throughout a resolution, so a bind chain inside\n` +
+    `// a class scope (the recursion in resolveType) follows the class scope too.\n` +
+    `function __disonLookupBind(typeKey: __DisonKey): __DisonFactory | undefined {\n` +
+    `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
+    `    const b = f.binds.get(typeKey);\n` +
+    `    if (b) return b;\n` +
+    `  }\n` +
+    `  if (__dison_classScopeCtx) for (const f of __dison_classScopeCtx) {\n` +
+    `    const b = f.binds.get(typeKey);\n` +
+    `    if (b) return b;\n` +
+    `  }\n` +
+    `  return TYPE_BINDINGS.get(typeKey);\n` +
+    `}\n\n` +
+    `// Scope-aware bind resolution. bind chains (bind A = B; bind B = C; resolves A to C).\n` +
+    `// Each hop of the chain also consults the current frame chain -> class -> global.\n` +
+    `// A cycle raises a clear error.\n` +
+    `${E}function resolveType<T>(typeKey: __DisonKey, defaultFactory: () => T): T {\n` +
+    `  const bound = __disonLookupBind(typeKey);\n` +
     `  if (!bound) return defaultFactory();\n` +
     `  if (_resolvingTypeBindings.has(typeKey)) {\n` +
     `    const label = typeof typeKey === 'function' ? (typeKey.name || '<anonymous class>') : String(typeKey);\n` +
     `    throw new Error('Detected a circular "bind" reference ("' + label + '"). The bind chain loops back on itself.');\n` +
     `  }\n` +
     `  _resolvingTypeBindings.add(typeKey);\n` +
+    `  try { return bound(); } finally { _resolvingTypeBindings.delete(typeKey); }\n` +
+    `}\n\n` +
+    `// injectable resolution. Re-enter the local scope captured at construction (scope) and set\n` +
+    `// this's class scope (cls's prototype chain) for the duration of the resolution. Re-entering\n` +
+    `// makes any dependency lazily constructed inside fallback run under the same local scope and\n` +
+    `// capture it too (the whole graph follows root's construction scope). The class scope is not\n` +
+    `// put in als, so a dependency never wrongly inherits this's class scope (it uses its own\n` +
+    `// this.constructor's class scope). Priority: override > fallback (bind or default\n` +
+    `// initializer), and within each: local > class > global.\n` +
+    `${E}function __disonResolveInjectable<T>(scope: __DisonFrame | undefined, cls: Function, prop: string, fallback: () => T): T {\n` +
+    `  const prevLocal = __dison_als.getStore();\n` +
+    `  const prevClass = __dison_classScopeCtx;\n` +
+    `  __dison_als.enterWith(scope);\n` +
+    `  __dison_classScopeCtx = __disonClassScopes(cls);\n` +
     `  try {\n` +
-    `    return bound();\n` +
+    `    const ov = getOverride(cls, prop);\n` +
+    `    return ov ? ov() : fallback();\n` +
     `  } finally {\n` +
-    `    _resolvingTypeBindings.delete(typeKey);\n` +
+    `    __dison_als.enterWith(prevLocal);\n` +
+    `    __dison_classScopeCtx = prevClass;\n` +
     `  }\n` +
+    `}\n\n` +
+    `// Desugar target for a non-top-level configuration. Build a new frame whose parent is the\n` +
+    `// current frame, populate its bind/override via setup, and enter it (enterWith). The return\n` +
+    `// value has Symbol.dispose, so a \`using\` declaration restores the previous frame at the end\n` +
+    `// of the enclosing block. setup uses the bind/override helpers to add the deltas.\n` +
+    `${E}function __disonEnterScope(\n` +
+    `  setup: (bind: (key: __DisonKey, factory: __DisonFactory) => void, override: (cls: Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): { [Symbol.dispose](): void } {\n` +
+    `  const frame: __DisonFrame = { binds: new Map(), overrides: new WeakMap(), parent: __dison_als.getStore() };\n` +
+    `  setup(\n` +
+    `    (key, factory) => { frame.binds.set(key, factory); },\n` +
+    `    (cls, prop, factory) => {\n` +
+    `      let e = frame.overrides.get(cls);\n` +
+    `      if (!e) { e = {}; frame.overrides.set(cls, e); }\n` +
+    `      e[prop] = factory;\n` +
+    `    }\n` +
+    `  );\n` +
+    `  const prev = __dison_als.getStore();\n` +
+    `  __dison_als.enterWith(frame);\n` +
+    `  return { [Symbol.dispose]() { __dison_als.enterWith(prev); } };\n` +
     `}\n`
   );
 }
 
-// 複数ファイルでランタイム状態（DI_REGISTRY/TYPE_BINDINGS）を共有するための
-// 共有ランタイムモジュールのソース。scripts/generate-runtime-module.tsが
-// これをsrc/generated-runtime.tsとして書き出し、tscがdist/にコンパイルする
-// ことで、"@no22/dison/runtime" として配布される（docs/packaging.md）。
+// 複数ファイルでランタイム状態を共有するための共有ランタイムモジュールのソース。
+// scripts/generate-runtime-module.tsがこれをsrc/generated-runtime.tsとして書き出し、
+// tscがdist/にコンパイルすることで、"@no22/dison/runtime" として配布される
+// （docs/packaging.md）。AsyncLocalStorage の import を先頭に付ける。
 export const DISON_RUNTIME_MODULE_SOURCE: string =
+  DISON_RUNTIME_IMPORTS +
   `// --- Dison shared runtime module ---\n` +
   `// Multiple generated files import this module to share runtime state\n` +
-  `// such as DI_REGISTRY/TYPE_BINDINGS.\n` +
+  `// such as DI_REGISTRY/TYPE_BINDINGS and the scope infrastructure.\n` +
   `// This file is auto-generated when the Dison package is built. Do not edit it by hand.\n\n` +
   generateRuntimeDeclarations("export ");
