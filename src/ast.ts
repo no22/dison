@@ -18,6 +18,12 @@ export interface BindEntry {
   originalTypeKey: string;
   replacementTypeName: string;
   replacementTypeKey: string;
+  // replacementArgs: "bind Original = Replacement(args);" の括弧内側の引数テキスト
+  // （そのまま new Replacement(<args>) のコンストラクタ引数として出力する）。
+  // 括弧を書かなかった場合（"bind Original = Replacement;"）や空括弧（"...()")の
+  // 場合は undefined（＝ new Replacement() 相当）。照合キー（chaining）には含めない。
+  // docs/bind-constructor-arguments.md 参照。
+  replacementArgs?: string;
   // token: "bind Original as Token = Replacement;" のas句（トークンの識別子参照。
   // 複数ファイルにまたがる同名interface/型エイリアスの衝突をtokenで明示的に
   // 回避するために使う。指定時はoriginalTypeKeyの代わりにこの識別子参照を

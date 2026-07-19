@@ -567,15 +567,15 @@ export class Parser {
     return { kind: "override", className, assignments };
   }
 
-  // "bind OriginalType = ReplacementType;" を解析する。
+  // "bind OriginalType = ReplacementType(args?);" を解析する。
   // override とは異なり、bind は「型を型で差し替える」という用途に限定する
   // ため、左辺・右辺とも単一の型参照（識別子＋任意のジェネリクス）のみを
   // 許可する（isSimpleTypeShapeが許容する形と同じ範囲。injectableの
   // resolveType呼び出しがこの形の型にしか使われないため、それ以上広げても
-  // 意味がない）。トランスパイラ側で自動的に `new ReplacementType()` を
-  // 補って生成する。コンストラクタに引数を渡したいなど、より複雑な差し替え
-  // が必要な場合は override によるプロパティ単位の指定を使うことを想定
-  // している。
+  // 意味がない）。差し替え先には任意でコンストラクタ引数
+  // `Replacement(args)` を後置でき、`new Replacement(args)` として生成される
+  // （docs/bind-constructor-arguments.md）。引数は照合キー（chaining）には
+  // 含めない（キーは型名のまま）。
   // context: parseOverrideと同じ規約（呼び出し側が完成した句を渡す）。
   private parseBind(context: string): BindEntry {
     this.next(); // 'bind'
@@ -591,6 +591,13 @@ export class Parser {
     this.skipTrivia();
     const replacement = this.parseGenericTypeRef(`bind "${original.display}"'s replacement type (${context})`);
     this.skipTrivia();
+
+    // 差し替え先の型参照の直後に "(" があれば、コンストラクタ引数リスト。
+    // 型参照の直後の "(" は関数呼び出し（＝コンストラクタ引数）としか解釈
+    // しようがないため曖昧さは無い（docs/bind-constructor-arguments.md）。
+    const replacementArgs = this.parseOptionalCallArgs(`bind "${original.display}" = "${replacement.display}"`);
+    this.skipTrivia();
+
     this.expectPunct(";", `bind "${original.display}" = "${replacement.display}"`);
 
     return {
@@ -599,8 +606,40 @@ export class Parser {
       originalTypeKey: original.key,
       replacementTypeName: replacement.display,
       replacementTypeKey: replacement.key,
+      replacementArgs,
       token,
     };
+  }
+
+  // 差し替え先の直後の "( ... )" を任意で読み取り、括弧内側の引数テキストを返す。
+  // 括弧が無ければ undefined、空括弧 "()" も undefined（＝ new Replacement() 相当）。
+  // 外側の "(" から対応する ")" まで、()[]{} の深さを数えて取り込むため、入れ子の
+  // 括弧やアロー関数本体 `{...}`、引数内の ";" も1つの引数リストとして正しく扱える
+  // （parseAssignment と同じ深さカウント方式）。
+  private parseOptionalCallArgs(context: string): string | undefined {
+    const open = this.peek();
+    if (!(open.type === "punct" && open.text === "(")) return undefined;
+    this.next(); // '('
+    let depth = 1;
+    const parts: string[] = [];
+    while (true) {
+      const t = this.peek();
+      if (t.type === "eof") {
+        throw new DisonParseError(`The argument list of ${context} is not closed with a matching ")"`, open.pos);
+      }
+      if (t.type === "punct" && (t.text === ")" || t.text === "]" || t.text === "}")) {
+        depth--;
+        if (depth === 0) {
+          this.next(); // 対応する ')' を消費（引数テキストには含めない）
+          break;
+        }
+      } else if (t.type === "punct" && (t.text === "(" || t.text === "[" || t.text === "{")) {
+        depth++;
+      }
+      parts.push(this.next().text);
+    }
+    const args = parts.join("").trim();
+    return args === "" ? undefined : args;
   }
 
   // bindの左辺・右辺で使う「識別子 ＋ 任意の <...>」を読み取る。injectableの

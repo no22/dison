@@ -97,6 +97,89 @@ class S { injectable dep: IUsed = new Impl(); }
   });
 });
 
+describe("bind: コンストラクタ引数（docs/bind-constructor-arguments.md）", () => {
+  it("差し替え先に引数を書くと new Replacement(args) が生成される", () => {
+    const out = transpileDisonToTS(`
+class Base {}
+class WithConn extends Base { constructor(c: string) { super(); } }
+configuration Cfg { bind Base = WithConn("prod://db"); }
+`);
+    expect(out).toContain('resolveType(WithConn, () => new WithConn("prod://db"))');
+  });
+
+  it("引数なし・空括弧はどちらも new Replacement() になる", () => {
+    const out = transpileDisonToTS(`
+class Base {}
+class Plain extends Base {}
+configuration Cfg { bind Base = Plain; bind Base = Plain(); }
+`);
+    const news = out.split("\n").filter((l) => l.includes("new Plain"));
+    expect(news.every((l) => l.includes("new Plain()"))).toBe(true);
+  });
+
+  it("入れ子の括弧・アロー関数を含む引数も1つの引数リストとして取り込む", () => {
+    const out = transpileDisonToTS(`
+class Base {}
+class Factory extends Base { constructor(make: () => number, opts: { n: number }) { super(); } }
+configuration Cfg { bind Base = Factory(() => 1 + 2, { n: 3 }); }
+`);
+    expect(out).toContain("new Factory(() => 1 + 2, { n: 3 })");
+  });
+
+  it("ジェネリクス＋引数を併用できる", () => {
+    const out = transpileDisonToTS(`
+interface Repo<T> { get(): T; }
+class PgRepo<T> implements Repo<T> { constructor(dsn: string) {} get(): T { return null as any; } }
+configuration Cfg { bind Repo<string> = PgRepo<string>("dsn"); }
+`);
+    expect(out).toContain('new PgRepo<string>("dsn")');
+  });
+
+  it("引数が実行時に実際にコンストラクタへ渡る", () => {
+    const mod = runGenerated(`
+class Base { desc() { return "base"; } }
+class WithConn extends Base { constructor(private conn: string) { super(); } desc() { return "conn=" + this.conn; } }
+class S { injectable dep: Base = new Base(); }
+configuration Cfg { bind Base = WithConn("prod://db"); }
+activate Cfg;
+module.exports = { v: (new S() as any).dep.desc() };
+`);
+    expect(mod.v).toBe("conn=prod://db");
+  });
+
+  it("単独bindの引数は関数のレキシカル変数を捕捉できる", () => {
+    const mod = runGenerated(`
+class Base { desc() { return "base"; } }
+class WithConn extends Base { constructor(private conn: string) { super(); } desc() { return "conn=" + this.conn; } }
+class S { injectable dep: Base = new Base(); }
+
+function setup(connStr: string) {
+  bind Base = WithConn(connStr);
+  return new S();
+}
+
+module.exports = { v: (setup("from-closure") as any).dep.desc() };
+`);
+    expect(mod.v).toBe("conn=from-closure");
+  });
+
+  it("as トークンと引数を併用できる", () => {
+    const out = transpileDisonToTS(`
+token IRepoToken;
+interface IRepo {}
+class Impl implements IRepo { constructor(x: number) {} }
+configuration Cfg { bind IRepo as IRepoToken = Impl(42); }
+`);
+    expect(out).toContain("bindType<IRepo>(IRepoToken, () => resolveType(Impl, () => new Impl(42)))");
+  });
+
+  it("引数リストが閉じていないとパースエラーになる", () => {
+    expect(() =>
+      transpileDisonToTS(`class Base {}\nclass X extends Base {}\nconfiguration Cfg { bind Base = X("unclosed; }`)
+    ).toThrow(/not closed with a matching/);
+  });
+});
+
 describe("bind: ジェネリクス対応", () => {
   it("識別子＋<...>の形をパースできる", () => {
     const out = transpileDisonToTS(`

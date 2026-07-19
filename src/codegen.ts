@@ -95,8 +95,11 @@ function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy): string
   // （具象クラスなら実体参照、そうでなければ文字列/companion）。左辺と同じ戦略を使う
   // ことで、ある型が「bindの左辺」と「別のbindの差し替え先」の両方に現れてもキーが一致する。
   const replacementKeyExpr = keyExprFor(entry.replacementTypeKey, undefined, strategy);
+  // "bind Original = Replacement(args)" のコンストラクタ引数（あれば）を new 式に渡す。
+  // 引数は tsc が Replacement のコンストラクタ型で検査する（docs/bind-constructor-arguments.md）。
+  const args = entry.replacementArgs ?? "";
   return [
-    `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}()));`,
+    `  bindType<${entry.originalTypeName}>(${originalKeyExpr}, () => resolveType(${replacementKeyExpr}, () => new ${entry.replacementTypeName}(${args})));`,
   ];
 }
 

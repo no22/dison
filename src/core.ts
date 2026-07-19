@@ -64,12 +64,13 @@
  *   `override` はクラス内の特定プロパティ1つだけを差し替えるのに対し、
  *   `bind` は「その型が要求される場所すべて」を横断的に差し替える。
  *   右辺は override と異なり任意の式ではなく、単一の型参照（具象クラス、
- *   ジェネリクス可）のみを許可し、トランスパイラが自動的に `new` を補う
- *   （コンストラクタに引数を渡したいケースは override のプロパティ単位
- *   指定を使うこと）。
+ *   ジェネリクス可）＋任意のコンストラクタ引数リストのみを許可し、
+ *   トランスパイラが自動的に `new Replacement(args)` を補う（引数は省略可。
+ *   docs/bind-constructor-arguments.md）。
  *
  *     configuration TestConfig {
  *       bind SqlUserRepository = MockUserRepository;
+ *       bind Repository = PostgresRepository("postgres://...");  // 引数あり
  *     }
  *
  *   左辺（差し替え元）はクラスだけでなく interface / type エイリアスも許可される。
