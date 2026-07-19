@@ -83,18 +83,42 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `  if (!entry) { entry = {}; DI_REGISTRY.set(cls, entry); }\n` +
     `  entry[prop] = factory;\n` +
     `}\n\n` +
-    `// Look up an override in order: local frame chain (inner->outer) -> class scopes\n` +
-    `// (child->parent) -> global (priority: local > class > global).\n` +
-    `${E}function getOverride(cls: Function, prop: string): __DisonFactory | undefined {\n` +
-    `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
-    `    const o = f.overrides.get(cls);\n` +
+    `// Override target matching walks the prototype chain of the receiver's class\n` +
+    `// (child -> parent, child-wins): an override targeting a base class applies to\n` +
+    `// subclass instances too, consistent with how injectable properties and class-scope\n` +
+    `// configurations are inherited (docs/override-inheritance.md). Same stop condition\n` +
+    `// as __disonClassScopes.\n` +
+    `function __disonClassChain(cls: Function): Function[] {\n` +
+    `  const out: Function[] = [];\n` +
+    `  for (let c: any = cls; c && c !== Function.prototype && c !== Object; c = Object.getPrototypeOf(c)) out.push(c);\n` +
+    `  return out;\n` +
+    `}\n` +
+    `// Match one override table against the class chain (child-wins).\n` +
+    `function __disonChainLookup(\n` +
+    `  map: { get(k: Function): Record<string, __DisonFactory> | undefined },\n` +
+    `  chain: Function[], prop: string\n` +
+    `): __DisonFactory | undefined {\n` +
+    `  for (const c of chain) {\n` +
+    `    const o = map.get(c);\n` +
     `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop];\n` +
+    `  }\n` +
+    `  return undefined;\n` +
+    `}\n` +
+    `// Look up an override in order: local frame chain (inner->outer) -> class scopes\n` +
+    `// (child->parent) -> global (priority: local > class > global). Scope-major: each\n` +
+    `// layer checks the whole class chain, so a nearer scope targeting a base class\n` +
+    `// beats a farther scope targeting the subclass.\n` +
+    `${E}function getOverride(cls: Function, prop: string): __DisonFactory | undefined {\n` +
+    `  const chain = __disonClassChain(cls);\n` +
+    `  for (let f = __dison_als.getStore(); f; f = f.parent) {\n` +
+    `    const hit = __disonChainLookup(f.overrides, chain, prop);\n` +
+    `    if (hit) return hit;\n` +
     `  }\n` +
     `  if (__dison_classScopeCtx) for (const f of __dison_classScopeCtx) {\n` +
-    `    const o = f.overrides.get(cls);\n` +
-    `    if (o && Object.prototype.hasOwnProperty.call(o, prop)) return o[prop];\n` +
+    `    const hit = __disonChainLookup(f.overrides, chain, prop);\n` +
+    `    if (hit) return hit;\n` +
     `  }\n` +
-    `  return DI_REGISTRY.get(cls)?.[prop];\n` +
+    `  return __disonChainLookup(DI_REGISTRY, chain, prop);\n` +
     `}\n\n` +
     `// Global type-replacement registry (bind). Key: class value (concrete class),\n` +
     `// companion/token Symbol, or type-name string. See docs/type-identity-matching.md.\n` +
@@ -177,7 +201,7 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
 
 // 複数ファイルでランタイム状態を共有するための共有ランタイムモジュールのソース。
 // scripts/generate-runtime-module.tsがこれをsrc/generated-runtime.tsとして書き出し、
-// tscがdist/にコンパイルすることで、"@no22/dison/runtime" として配布される
+// tscがdist/にコンパイルすることで、"dison/runtime" として配布される
 // （docs/packaging.md）。AsyncLocalStorage の import を先頭に付ける。
 export const DISON_RUNTIME_MODULE_SOURCE: string =
   DISON_RUNTIME_IMPORTS +
