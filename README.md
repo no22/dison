@@ -142,7 +142,9 @@ needed) for the place it's written:
   and concurrent async requests don't interfere.
 - **Directly inside a class body** → a **class scope**: that class's
   declarative DI wiring, shared by all its instances and inherited by
-  subclasses (which can override just the parts they change).
+  subclasses (which can override just the parts they change). If the
+  same class body wires the same key twice, the last configuration
+  wins (new in 1.6.0).
 
 ```dison
 class UserService {
@@ -235,6 +237,11 @@ bind Repository = PostgresRepository("postgres://localhost/db");
 The arguments are type-checked against the replacement's constructor,
 and a standalone `bind`'s arguments can capture local variables.
 
+When bind chains redirect the replacement (`bind A = B("x"); bind B = C;`),
+`A` resolves all the way to `new C()` and `B`'s arguments are not used —
+arguments only matter on the *final* replacement of a chain. This is by
+design: a chain replaces `B` wholesale, constructor call included.
+
 ### `token`
 
 Most name clashes are resolved automatically (see *Automatic collision
@@ -297,6 +304,13 @@ classes defined in another — as long as they all resolve
 `@no22/dison/runtime` to the same installed copy (in practice: they're part of the same project
 and share a common `node_modules` ancestor, which is the normal case).
 
+The CLI also fails the build with a specific fix suggestion when a
+`bind`/`override` in one file could **never match** its declaration in
+another — e.g. you bound a class without importing it, or imported it
+`type`-only where the identity key needs the runtime value (new in
+1.6.0). Previously such mistakes were silent no-ops unless you ran
+`tsc`.
+
 ## Requirements
 
 The generated code targets a modern TypeScript/Node toolchain:
@@ -309,6 +323,12 @@ The generated code targets a modern TypeScript/Node toolchain:
   `@types/node`.
 - Everything else (`injectable`/`override`/`bind`, global and class
   scopes) has no special requirement beyond a current TypeScript.
+  Since 1.6.0, a **single-file** transpile that uses no local scopes
+  emits no `node:async_hooks` import at all (a synchronous stub is
+  inlined instead), so that output also runs outside Node — in a
+  browser, for example. Multi-file output shares state through
+  `@no22/dison/runtime`, which does import `node:async_hooks`, so
+  multi-file projects remain Node-oriented.
 
 The runtime module (`@no22/dison/runtime`) is shipped pre-compiled, so
 these requirements apply to *your generated `.ts` files*, not to the
