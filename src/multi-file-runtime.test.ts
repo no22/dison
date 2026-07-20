@@ -7,9 +7,10 @@ describe("複数ファイル対応フェーズ1（docs/multi-file-support.md）"
     // ランタイムの宣言本体がインラインされる（関数定義がある）。
     expect(out).toContain("const DI_REGISTRY = new WeakMap");
     expect(out).toContain("function __disonEnterScope");
-    // スコープ対応で AsyncLocalStorage の import は付くが、ランタイム本体を別モジュールから
-    // import はしない。
-    expect(out).toContain('import { AsyncLocalStorage } from "node:async_hooks";');
+    // ローカルスコープを使わないファイルは AsyncLocalStorage の同期スタブでインライン
+    // 生成され、node:async_hooks への import は付かない（監査#7）。ランタイム本体を
+    // 別モジュールから import もしない。
+    expect(out).not.toContain("node:async_hooks");
     expect(out).not.toMatch(/} from "\.\//);
   });
 

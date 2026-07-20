@@ -226,6 +226,122 @@ export function computeCompanionPlanByFile(files: DisonFileInput[]): Map<string,
 }
 
 /**
+ * 複数ファイルモードのクロスファイルキー不一致検出（docs/cross-file-key-mismatch.md、
+ * 仕様監査2026-07 #4）。
+ *
+ * このファイルで文字列キーに落ちる（またはキー評価が失敗し続ける）裸の識別子が、
+ * 他のプロジェクトファイルでは identity（クラス実体）/companion Symbol でキー化される
+ * 宣言を持つ場合、キーは決して一致せず bind/override が黙って無効になる。これを
+ * transpile時エラーとして検出する。
+ *
+ * 対象サイト: bindの左辺・差し替え先、override対象クラス、injectableの型注釈
+ * （いずれも "as トークン" なしの裸の識別子のみ）。判定:
+ *   - ローカル宣言あり / value-import済み → 安全（identity/companion側でキー化）。
+ *   - type-only import されたプロジェクトのクラス → エラー（実体キーには値が必要。
+ *     "type" を外すよう案内）。interface の type-only import は companion の既存機構
+ *     （importedProjectInterfaceLocalNames が typeOnly も対象にする）で解決されるので安全。
+ *   - importなしで他プロジェクトファイルにクラス/interface宣言あり → エラー
+ *     （importするか as トークンを案内）。
+ *   - どこにも宣言なし → 対象外（外部パッケージ型の文字列キーは正当。純粋な
+ *     タイプミスは従来どおりtscの担当。const代入クラス等ヒューリスティックで
+ *     追えない宣言形への誤検出を避けるための線引き）。
+ */
+export function findCrossFileKeyMismatches(files: DisonFileInput[]): BindCollisionDiagnostic[] {
+  const classIndex = buildProjectClassIndex(files);
+  const interfaceIndex = buildProjectInterfaceIndex(files);
+  const diagnostics: BindCollisionDiagnostic[] = [];
+
+  for (const file of files) {
+    const tokens = new Lexer(file.source).tokenize();
+    const typeKinds = collectDeclaredTypeKinds(tokens);
+    const ast = new Parser(tokens, typeKinds).parseProgram();
+    const normSelf = normalizeExtensionlessAbsolutePath(file.path);
+
+    // このファイル内に何らかの宣言がある名前（クラス/abstract/interface/型エイリアス）。
+    // ローカル宣言があればそのファイル内では identity/companion 側でキー化される。
+    const localNames = new Set([...typeKinds.classNames, ...typeKinds.nonNewableTypeNames]);
+    const importsByLocalName = new Map(collectImportBindings(tokens).map((b) => [b.localName, b]));
+
+    // 他プロジェクトファイルで name を宣言しているファイルを探す。
+    const declaredElsewhere = (name: string): { file: string; kind: "class" | "interface" }[] => {
+      const out: { file: string; kind: "class" | "interface" }[] = [];
+      for (const g of files) {
+        const normG = normalizeExtensionlessAbsolutePath(g.path);
+        if (normG === normSelf) continue;
+        if (classIndex.get(normG)?.has(name)) out.push({ file: g.path, kind: "class" });
+        else if (interfaceIndex.get(normG)?.has(name)) out.push({ file: g.path, kind: "interface" });
+      }
+      return out;
+    };
+
+    const check = (typeKey: string, hasToken: boolean, site: string): void => {
+      if (hasToken) return;
+      const name = baseIdentifierOf(typeKey);
+      if (name !== typeKey) return; // ジェネリクス等の複合型は文字列キーが正当
+      if (localNames.has(name)) return;
+      const imp = importsByLocalName.get(name);
+      if (imp !== undefined && !imp.typeOnly) return; // value-import済み（外部パッケージ含め安全）
+
+      if (imp !== undefined && imp.typeOnly) {
+        // type-only import: 宣言元がプロジェクトのクラスの場合のみ問題
+        // （interfaceのtype-only importはcompanion機構が解決する。外部パッケージは文字列キーで一貫）。
+        if (!imp.specifier.startsWith(".")) return;
+        const resolved = normalizeExtensionlessAbsolutePath(
+          path.resolve(path.dirname(file.path), imp.specifier)
+        );
+        if (classIndex.get(resolved)?.has(imp.importedName)) {
+          diagnostics.push({
+            name,
+            message:
+              `${file.path}'s ${site}: "${name}" is imported type-only from "${imp.specifier}", ` +
+              `but it is a class matched by identity there — an identity key needs the runtime value. ` +
+              `Remove "type" from the import.`,
+          });
+        }
+        return;
+      }
+
+      // importなし: 他プロジェクトファイルの宣言と同名なら、文字列キーは決して一致しない。
+      const decls = declaredElsewhere(name);
+      if (decls.length === 0) return;
+      const where = decls.map((d) => `${d.file} (as a ${d.kind})`).join(", ");
+      diagnostics.push({
+        name,
+        message:
+          `${file.path}'s ${site}: "${name}" is declared in ${where} and matched by ` +
+          `${decls[0].kind === "class" ? "class identity" : "a companion Symbol"} there, ` +
+          `but this file neither declares nor imports it, so it would fall back to a string key ` +
+          `that can never match. Import it from the declaring file, or key both sides explicitly ` +
+          `with "as <token>".`,
+      });
+    };
+
+    const visitBind = (entry: BindEntry, label: string): void => {
+      check(entry.originalTypeKey, entry.token !== undefined, `bind "${entry.originalTypeName}" (${label})`);
+      check(entry.replacementTypeKey, false, `bind replacement "${entry.replacementTypeName}" (${label})`);
+    };
+
+    for (const node of ast) {
+      if (node.kind === "injectable") {
+        check(node.typeKey, node.token !== undefined, `injectable "${node.propName}"`);
+      } else if (node.kind === "configuration") {
+        const label = node.name !== undefined ? `configuration "${node.name}"` : "anonymous configuration";
+        for (const entry of node.entries) {
+          if (entry.kind === "bind") visitBind(entry, label);
+          else check(entry.className, false, `override "${entry.className}" (${label})`);
+        }
+      } else if (node.kind === "standalone-bind") {
+        visitBind(node.entry, "standalone");
+      } else if (node.kind === "standalone-override") {
+        check(node.entry.className, false, `override "${node.entry.className}" (standalone)`);
+      }
+    }
+  }
+
+  return diagnostics;
+}
+
+/**
  * 複数の.disファイルを横断して、`bind`の左辺や`injectable`の型注釈に
  * 使われている型名（クラス/interface/型エイリアスを問わない）の衝突を
  * 検出する（docs/bind-interface-token.md、案D）。

@@ -248,3 +248,83 @@ module.exports = { v: (new S() as any).dep.n() };
     expect(mod.v).toBe("mock");
   });
 });
+
+describe("同一クラス本体の複数無名configurationは後勝ち（監査#6）", () => {
+  it("同じキーへのbindは後に書いたconfigurationが勝つ", () => {
+    const mod = runGenerated(`
+class Repo { name = "real"; }
+class M1 extends Repo { name = "m1"; }
+class M2 extends Repo { name = "m2"; }
+class S {
+  injectable repo: Repo;
+  configuration { bind Repo = M1; }
+  configuration { bind Repo = M2; }
+}
+module.exports = { v: (new S() as any).repo.name };
+`);
+    expect(mod.v).toBe("m2");
+  });
+
+  it("継承の優先（子が親に勝つ）は維持される", () => {
+    const mod = runGenerated(`
+class Repo { name = "real"; }
+class MP extends Repo { name = "parent"; }
+class MC extends Repo { name = "child"; }
+class Base {
+  injectable repo: Repo;
+  configuration { bind Repo = MP; }
+}
+class Sub extends Base {
+  configuration { bind Repo = MC; }
+}
+module.exports = { base: (new Base() as any).repo.name, sub: (new Sub() as any).repo.name };
+`);
+    expect(mod.base).toBe("parent");
+    expect(mod.sub).toBe("child");
+  });
+});
+
+describe("node:async_hooks への依存はローカルスコープ使用時のみ（監査#7）", () => {
+  it("ローカルスコープを使わないファイルはimportなし＋同期スタブ", () => {
+    const out = transpileDisonToTS(`
+class Repo { name = "real"; }
+class S {
+  injectable repo: Repo;
+  configuration { bind Repo = Repo; }
+}
+configuration G { override S { repo = new Repo(); } }
+`);
+    expect(out).not.toContain("node:async_hooks");
+    expect(out).toContain("AsyncLocalStorage stub");
+  });
+
+  it("ローカルスコープを使うファイルは本物のAsyncLocalStorageをimportする", () => {
+    const out = transpileDisonToTS(`
+class Repo { name = "real"; }
+class Mock extends Repo { name = "mock"; }
+class S { injectable repo: Repo; }
+function t(): void {
+  configuration { bind Repo = Mock; }
+}
+`);
+    expect(out).toContain('import { AsyncLocalStorage } from "node:async_hooks";');
+    expect(out).not.toContain("AsyncLocalStorage stub");
+  });
+
+  it("スタブ生成でもグローバル/クラススコープの解決は従来どおり動く", () => {
+    const mod = runGenerated(`
+class Repo { name = "real"; }
+class MockG extends Repo { name = "global"; }
+class MockC extends Repo { name = "class"; }
+class SG { injectable repo: Repo; }
+class SC {
+  injectable repo: Repo;
+  configuration { bind Repo = MockC; }
+}
+bind Repo = MockG;
+module.exports = { g: (new SG() as any).repo.name, c: (new SC() as any).repo.name };
+`);
+    expect(mod.g).toBe("global");
+    expect(mod.c).toBe("class");
+  });
+});

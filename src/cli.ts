@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'fs';
 import * as path from 'path';
-import { transpileDisonToTS, findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from './core.js'; // ※NodeNext環境のために.jsをつけます
+import { transpileDisonToTS, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from './core.js'; // ※NodeNext環境のために.jsをつけます
 
 // 複数ファイルの生成コードが共有ランタイム（DI_REGISTRY/TYPE_BINDINGS等）を
 // importする際に使うパッケージのサブパス。@no22/disonパッケージ自身が
@@ -62,6 +62,20 @@ function transpileMultipleFiles(inputFiles: string[]): void {
     throw new Error(
       `Possible bind/injectable type-name collisions across files` +
         ` (${collisions.length}). No files were generated.\n${details}`
+    );
+  }
+
+  // クロスファイルキー不一致（import忘れ・type-onlyインポートのクラス）の検出
+  // （docs/cross-file-key-mismatch.md）。文字列キーに落ちた識別子が他ファイルの
+  // identity/companionキー宣言と決して一致しない＝bind/overrideが黙って無効になる
+  // ケースを、変換前にエラーとして報告する。
+  const mismatches = findCrossFileKeyMismatches(fileInputs);
+  if (mismatches.length > 0) {
+    const details = mismatches.map((c) => `  - ${c.message}`).join('\n');
+    throw new Error(
+      `Cross-file key mismatches detected (${mismatches.length}):` +
+        ` these bind/override/injectable keys can never match their declarations.` +
+        ` No files were generated.\n${details}`
     );
   }
 

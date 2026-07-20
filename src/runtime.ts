@@ -31,8 +31,29 @@
 // モードでは core.ts が、複数ファイルモードでは共有ランタイムモジュールが先頭に付ける。
 export const DISON_RUNTIME_IMPORTS = `import { AsyncLocalStorage } from "node:async_hooks";\n`;
 
-export function generateRuntimeDeclarations(exportKeyword: "" | "export "): string {
+// alsMode（docs/spec-audit-2026-07.md #7）:
+//   - "node": 本物の AsyncLocalStorage を使う（要 node:async_hooks import）。ローカル
+//     スコープを使うファイル・共有ランタイムモジュールはこちら。
+//   - "stub": 同期変数によるスタブ。ローカルスコープを使わないファイルでは、alsの
+//     ストアは__disonResolveInjectableの同期的なenter/restoreペアでしか触られないため
+//     ただの変数と等価。node:async_hooks への依存が消え、ブラウザ等でも動く。
+export function generateRuntimeDeclarations(
+  exportKeyword: "" | "export ",
+  alsMode: "node" | "stub" = "node"
+): string {
   const E = exportKeyword;
+  const alsDecl =
+    alsMode === "node"
+      ? `${E}const __dison_als = new AsyncLocalStorage<__DisonFrame | undefined>();\n`
+      : `// AsyncLocalStorage stub: this file uses no local scopes, so the store is only\n` +
+        `// touched synchronously (enter/restore pairs inside __disonResolveInjectable).\n` +
+        `// A plain variable is equivalent, and it avoids importing the Node-only\n` +
+        `// async-hooks module (the generated file also runs outside Node).\n` +
+        `${E}const __dison_als = {\n` +
+        `  _store: undefined as __DisonFrame | undefined,\n` +
+        `  getStore(): __DisonFrame | undefined { return this._store; },\n` +
+        `  enterWith(store: __DisonFrame | undefined): void { this._store = store; },\n` +
+        `};\n`;
   return (
     `// --- registration queue (docs/config-forward-reference.md) ---\n` +
     `// Registrations are queued (with a global sequence number) and applied lazily the\n` +
@@ -90,7 +111,7 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `  store.pending = remaining;\n` +
     `}\n\n` +
     `// --- scope infrastructure (docs/scoped-configuration.md) ---\n` +
-    `${E}const __dison_als = new AsyncLocalStorage<__DisonFrame | undefined>();\n` +
+    alsDecl +
     `// Current scope frame (undefined = global only). Captured by injectable at construction.\n` +
     `${E}function __disonCurrentScope(): __DisonFrame | undefined { return __dison_als.getStore(); }\n\n` +
     `// Class scopes (an anonymous configuration directly inside a class body).\n` +
@@ -104,13 +125,18 @@ export function generateRuntimeDeclarations(exportKeyword: "" | "export "): stri
     `// A class-body configuration is placed as a static __dison_classScope_N field. Walk\n` +
     `// this.constructor's prototype chain (child -> parent) and collect the fields each class\n` +
     `// owns (inheritance: a subclass inherits its parent's class scope and can override just\n` +
-    `// the delta).\n` +
+    `// the delta). Within one class the frames are collected in reverse definition order,\n` +
+    `// so when the same class body has several configurations for the same key, the LAST\n` +
+    `// one wins (matching the last-assignment-wins intuition, and the behavior of\n` +
+    `// sequential global registrations and nested local scopes).\n` +
     `function __disonClassScopes(cls: Function): __DisonFrame[] {\n` +
     `  const out: __DisonFrame[] = [];\n` +
     `  for (let c: any = cls; c && c !== Function.prototype && c !== Object; c = Object.getPrototypeOf(c)) {\n` +
+    `    const own: __DisonFrame[] = [];\n` +
     `    for (const key of Object.getOwnPropertyNames(c)) {\n` +
-    `      if (key.indexOf('__dison_classScope') === 0) out.push(c[key]);\n` +
+    `      if (key.indexOf('__dison_classScope') === 0) own.push(c[key]);\n` +
     `    }\n` +
+    `    for (let i = own.length - 1; i >= 0; i--) out.push(own[i]);\n` +
     `  }\n` +
     `  return out;\n` +
     `}\n` +

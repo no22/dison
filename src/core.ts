@@ -250,7 +250,7 @@ import {
   type CompanionImport,
 } from "./codegen.js";
 import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE, DISON_RUNTIME_IMPORTS } from "./runtime.js";
-import { findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
+import { findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
 import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo } from "./collisions.js";
 
 export interface TranspileOptions {
@@ -339,16 +339,23 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
     }
   }
 
-  // スコープ対応（docs/scoped-configuration.md）で AsyncLocalStorage を使うため、
-  // ランタイムの import を生成物の先頭に置く。単一ファイル（インライン）モードでも
-  // ランタイム宣言が als を参照するので、この import が必要。
+  // ランタイム前置き（docs/spec-audit-2026-07.md #7）:
+  //   - 複数ファイルモード: 生成ファイル自身は AsyncLocalStorage を参照しない
+  //     （als は共有ランタイムモジュール側にある）ため、node:async_hooks の import は
+  //     生成ファイルには出さない。
+  //   - 単一ファイルモード: ローカルスコープの configuration を使うファイルだけが
+  //     本物の AsyncLocalStorage（node:async_hooks）を必要とする。使わないファイルは
+  //     同期スタブでインライン生成し、Node 以外のランタイムでも動く生成物にする。
+  const usesLocalScope = ast.some((n) => n.kind === "configuration" && n.scope === "local");
   const header = `// --- Auto-generated TypeScript code ---\n\n`;
   const prelude = options.runtimeModulePath
-    ? `${header}${DISON_RUNTIME_IMPORTS}import {\n` +
+    ? `${header}import {\n` +
       `  bindTypeLazy,\n  resolveType,\n  registerOverrideLazy,\n` +
       `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScopeLazy,\n  __disonBuildFrameLazy,\n` +
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
-    : `${header}${DISON_RUNTIME_IMPORTS}\n${generateRuntimeDeclarations("")}\n`;
+    : usesLocalScope
+    ? `${header}${DISON_RUNTIME_IMPORTS}\n${generateRuntimeDeclarations("", "node")}\n`
+    : `${header}\n${generateRuntimeDeclarations("", "stub")}\n`;
 
   // ES Modules の import はファイル先頭にしか書けないため、import 系（companion import、
   // "activate ... from" の import）を前置きの直後にまとめて出す。companion の const 宣言
@@ -363,5 +370,5 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
 
 // 公開API: 複数ファイル対応（docs/multi-file-support.md、
 // docs/bind-interface-token.md）。CLIが複数ファイルを一括処理する際に使う。
-export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions, computeIdentityKeyClassesByFile, computeCompanionPlanByFile };
+export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile };
 export type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo };
