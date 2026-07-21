@@ -94,7 +94,9 @@ class UserService {
 ### `configuration` / `activate`
 
 Groups a set of `override`/`bind` statements. A **named** configuration
-is activated explicitly with `activate`:
+is activated explicitly with `activate`. Naming and `activate` are a
+**global-scope-only** feature — see [Scoped configuration](#scoped-configuration-new-in-120)
+below for local/class scopes, which use anonymous configurations instead:
 
 ```dison
 configuration TestConfig {
@@ -180,9 +182,13 @@ generator instead.
 > code that uses them needs `Symbol.dispose` (TypeScript 5.2+ / Node 20+)
 > and `node:async_hooks` at runtime. See [Requirements](#requirements).
 
-*(Named local/class configurations, and activating them by name, aren't
-supported yet — use an anonymous `configuration { ... }` for local and
-class scopes.)*
+*(Naming a configuration and activating it by name is a global-scope-only
+feature, by design — local and class scopes only take an anonymous
+`configuration { ... }`, which is auto-active for the scope it's written
+in. This isn't a gap to be filled later: the dynamic, explicit-activation
+model that named configurations need doesn't fit scopes that are already
+tied lexically to a block or class, so it's intentionally not offered
+there.)*
 
 ### `override`
 
