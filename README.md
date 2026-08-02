@@ -5,11 +5,15 @@ Dison is an experimental DSL that transpiles to TypeScript. It builds
 injection reads like ordinary class syntax instead of framework
 boilerplate.
 
-The transpiled output happens to look like a `ServiceLocator`-style
-registry under the hood — but that's an implementation detail of the
-generated code, hidden below Dison's own language semantics. As a
-Dison user you write `injectable`, `override`, `bind`, and `configuration`
-declarations; you never touch the registry directly.
+The transpiled output used to look like a `ServiceLocator`-style
+registry under the hood — an implementation detail hidden below
+Dison's own language semantics. Since 2.0 it usually doesn't even look
+like that: when your wiring is declarative (which Dison encourages),
+**static resolution** proves each injection decision at transpile time
+and folds it into the code. The output is then just classes and plain
+`new` expressions — no registry, no runtime helpers, no dependencies.
+The registry remains only as a fallback for wiring that is genuinely
+dynamic. See [Static resolution](#static-resolution-new-in-20).
 
 ## Install
 
@@ -146,7 +150,8 @@ needed) for the place it's written:
   declarative DI wiring, shared by all its instances and inherited by
   subclasses (which can override just the parts they change). If the
   same class body wires the same key twice, the last configuration
-  wins (new in 1.6.0).
+  wins (new in 1.6.0). Class scopes are lexical, so static resolution
+  folds them at transpile time (new in 2.0).
 
 ```dison
 class UserService {
@@ -303,10 +308,14 @@ Pass more than one file to the CLI to transpile a project as a unit:
 npx dison a.dis b.dis c.dis
 ```
 
-Input files can live in different directories. Their generated output
-shares override/bind state through the `@no22/dison/runtime` package
-export, so an `override`/`bind` activated in one file is visible from
-classes defined in another — as long as they all resolve
+Input files can live in different directories. The transpiler analyzes
+the project as a whole: wiring it can prove static is folded directly
+into the consuming getters (across files, via generated factory
+functions — see [Static resolution](#static-resolution-new-in-20)),
+and a fully-declarative project needs no runtime at all. Any dynamic
+residue shares override/bind state through the `@no22/dison/runtime`
+package export, so an `override`/`bind` activated in one file is
+visible from classes defined in another — as long as they all resolve
 `@no22/dison/runtime` to the same installed copy (in practice: they're part of the same project
 and share a common `node_modules` ancestor, which is the normal case).
 
@@ -317,24 +326,89 @@ another — e.g. you bound a class without importing it, or imported it
 1.6.0). Previously such mistakes were silent no-ops unless you ran
 `tsc`.
 
+## Static resolution (new in 2.0)
+
+Declarative wiring doesn't need to exist at runtime. For every
+`injectable`, the transpiler tries to prove what the winner will be —
+across `bind` chains, `override` inheritance, class scopes, and (in
+multi-file mode) module evaluation order — and, when the proof
+succeeds, folds it straight into the getter:
+
+```ts
+get repo(): Repository {
+  if (!this._repo) { this._repo = new CachedRepository(); }
+  return this._repo!;
+}
+```
+
+When *every* injectable in a file folds, the registry machinery is not
+emitted at all: the output is plain TypeScript with **zero runtime
+dependencies**, and it runs anywhere. This applies to whole multi-file
+projects too — cross-file winners are wired through generated factory
+functions (direct calls, no shared registry), and a fully-declarative
+project stops importing `@no22/dison/runtime` entirely.
+
+What folds:
+
+- injectables with no wiring at all (the default initializer);
+- any wiring that executes before the first executable top-level
+  statement — the "declarative header" style;
+- wiring after executable statements, when the analysis can prove
+  those statements cannot resolve the key (it traces the identifiers a
+  statement mentions through declarations, imports, bind chains and
+  override values);
+- class-scope configurations, including inheritance.
+
+What stays on the registry — with the reason, which you can inspect
+with **`dison --explain <file>`**:
+
+```
+UserService.repo   → new MockUserRepository()   [static: bind IRepository (top-level wiring)]
+Chained.value      → runtime lookup             [dynamic: activated after executable top-level code]
+Handler.db         → runtime lookup             [dynamic: bound in a local scope]
+```
+
+Dynamic wiring keeps its exact 1.x behavior: `activate` calls that run
+after a key was already used (or inside functions/conditionals), local
+scopes, wiring on a subclass that diverges from its parent, and
+anything the analysis cannot prove. Static and dynamic keys coexist in
+one file — each getter independently gets the cheapest form that
+preserves behavior. `dison --no-static` disables folding and restores
+the full 1.x registry output.
+
+One **semantic change** comes with this (hence the major version): a
+single-file transpile is now treated as self-contained. If a file's
+wiring folds completely, its exported `activate...()` functions become
+no-ops — importing a *separately transpiled* single-file module and
+activating its configurations from outside no longer rewires it. That
+pattern was never the supported route for cross-file wiring; pass all
+files to the CLI together (multi-file mode) as before, or use
+`--no-static`.
+
 ## Requirements
 
-The generated code targets a modern TypeScript/Node toolchain:
+The generated code targets a modern TypeScript/Node toolchain, but
+what it actually needs depends on how much of your wiring is static:
 
+- **Fully-static output** (everything folded — see
+  [Static resolution](#static-resolution-new-in-20)) is plain
+  TypeScript with no imports and no special requirements. It runs in
+  a browser, on the edge, anywhere. This includes fully-declarative
+  multi-file projects, which since 2.0 emit no
+  `@no22/dison/runtime` import at all.
 - **TypeScript 5.2+** and **Node.js 20+** if you use **local scopes**
   (an anonymous `configuration` inside a function/method body). Those
   desugar to `using` + `AsyncLocalStorage`, which need `Symbol.dispose`
   and `node:async_hooks`. Your `tsconfig.json` needs a `lib` that
   includes `Symbol.dispose` (e.g. `"lib": ["esnext"]`) and
   `@types/node`.
-- Everything else (`injectable`/`override`/`bind`, global and class
-  scopes) has no special requirement beyond a current TypeScript.
-  Since 1.6.0, a **single-file** transpile that uses no local scopes
-  emits no `node:async_hooks` import at all (a synchronous stub is
-  inlined instead), so that output also runs outside Node — in a
-  browser, for example. Multi-file output shares state through
-  `@no22/dison/runtime`, which does import `node:async_hooks`, so
-  multi-file projects remain Node-oriented.
+- **Other dynamic wiring** (late or conditional `activate`, diverging
+  subclass wiring, ...) keeps the inlined registry in single-file
+  output — without local scopes it uses a synchronous stub instead of
+  `node:async_hooks` (since 1.6.0), so it still runs outside Node.
+  Multi-file output with dynamic residue shares state through
+  `@no22/dison/runtime`, which does import `node:async_hooks`, so such
+  projects remain Node-oriented.
 
 The runtime module (`@no22/dison/runtime`) is shipped pre-compiled, so
 these requirements apply to *your generated `.ts` files*, not to the
@@ -344,9 +418,11 @@ package itself.
 
 See [`sample/`](sample/) for runnable, self-contained examples covering
 `injectable`/`override`/`activate`, `bind` (including generics and
-chaining), and a multi-file project where two files declare their own
-same-named `IRepository` interface and Dison keeps them apart
-automatically — no tokens needed.
+chaining), the declarative-header style and class scopes folded by
+static resolution, a central-config project wired across files with
+zero runtime dependencies, and a multi-file project where two files
+declare their own same-named `IRepository` interface and Dison keeps
+them apart automatically — no tokens needed.
 
 ## License
 
