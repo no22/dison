@@ -58,7 +58,7 @@ interface CollisionOccurrence {
 // findBindCollisionsで、あるファイルのローカル宣言と、それを相対パスで
 // 正しくimportしている別ファイルとを同じ実体として一致させるために使う
 // （拡張子（.dis/.ts/無し）の書き方の違いを吸収する）。
-function normalizeExtensionlessAbsolutePath(filePath: string): string {
+export function normalizeExtensionlessAbsolutePath(filePath: string): string {
   const abs = path.resolve(filePath);
   const ext = path.extname(abs);
   return ext ? abs.slice(0, -ext.length) : abs;
@@ -67,7 +67,7 @@ function normalizeExtensionlessAbsolutePath(filePath: string): string {
 // 全入力ファイルから「正規化パス -> そのファイルで宣言された実体キー化可能な
 // クラス名（具象 ＋ abstract）の集合」のインデックスを作る。value-importされた
 // クラスの実体キー解決に使う。abstract class も実行時に値を持つので含める。
-function buildProjectClassIndex(files: DisonFileInput[]): Map<string, Set<string>> {
+export function buildProjectClassIndex(files: DisonFileInput[]): Map<string, Set<string>> {
   const index = new Map<string, Set<string>>();
   for (const file of files) {
     const tokens = new Lexer(file.source).tokenize();
@@ -80,7 +80,7 @@ function buildProjectClassIndex(files: DisonFileInput[]): Map<string, Set<string
 // 全入力ファイルから「正規化パス -> そのファイルで宣言された真の interface/型
 // エイリアス名の集合」のインデックスを作る（abstract class は含めない＝実体キー側）。
 // companion Symbol でキー化する型のクロスファイル解決に使う（案A(b)(c)）。
-function buildProjectInterfaceIndex(files: DisonFileInput[]): Map<string, Set<string>> {
+export function buildProjectInterfaceIndex(files: DisonFileInput[]): Map<string, Set<string>> {
   const index = new Map<string, Set<string>>();
   for (const file of files) {
     const tokens = new Lexer(file.source).tokenize();
@@ -94,7 +94,7 @@ function buildProjectInterfaceIndex(files: DisonFileInput[]): Map<string, Set<st
 // エイリアス」を、ローカル名 -> {specifier, 元名} で返す。companion は値として別途
 // import するため、interface 自体が型onlyインポート（import type）でも対象にする
 // （実体キー化するクラスと違い、値importである必要がない。案A(b)(c)）。
-function importedProjectInterfaceLocalNames(
+export function importedProjectInterfaceLocalNames(
   file: DisonFileInput,
   interfaceIndex: Map<string, Set<string>>
 ): Map<string, CompanionImportInfo> {
@@ -116,7 +116,7 @@ function importedProjectInterfaceLocalNames(
 // 宣言元ファイルはそのクラスをローカル宣言として実体キー化するので、import側も
 // 同じ実体（ES Modulesの共有束縛）を実体キーにすることで、複数ファイルにまたがる
 // bind/injectableが同じキーで一致する（docs/type-identity-matching.md 案A(a)）。
-function importedProjectClassLocalNames(
+export function importedProjectClassLocalNames(
   file: DisonFileInput,
   classIndex: Map<string, Set<string>>
 ): Set<string> {

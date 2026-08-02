@@ -1,0 +1,29 @@
+// The service layer of a small multi-file project. It declares its
+// dependencies but does no wiring at all — that lives in app.dis, the
+// entry module, which binds Repository to a Postgres implementation.
+//
+// See app.dis for how to run this sample.
+
+export class Repository {
+  find(id: string) {
+    return { id, from: "default repository" };
+  }
+}
+
+export class PostgresRepository extends Repository {
+  constructor(private readonly url: string) {
+    super();
+  }
+  find(id: string) {
+    return { id, from: `postgres @ ${this.url}` };
+  }
+}
+
+export class UserService {
+  injectable repo: Repository;
+
+  lookup(id: string): string {
+    const row = this.repo.find(id);
+    return `${row.id} (${row.from})`;
+  }
+}

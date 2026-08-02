@@ -19,7 +19,7 @@ token IRepositoryToken;
 interface IRepository {}
 class Impl implements IRepository {}
 class S { injectable dep: IRepository as IRepositoryToken = new Impl(); }
-`);
+`, { staticResolution: false });
     expect(out).toContain("resolveType(IRepositoryToken, () => (new Impl()))");
   });
 
@@ -29,7 +29,7 @@ token IRepositoryToken;
 interface IRepository {}
 class Mock implements IRepository {}
 configuration Cfg { bind IRepository as IRepositoryToken = Mock; }
-`);
+`, { staticResolution: false });
     // 左辺のキーはトークン（IRepositoryToken）。差し替え先 Mock は具象クラスなので
     // 実体参照キー（resolveType(Mock, ...)）になる。
     expect(out).toContain('bindTypeLazy<IRepository>(() => IRepositoryToken, () => resolveType(Mock,');
@@ -43,7 +43,7 @@ configuration Cfg { bind IRepository as IRepositoryToken = Mock; }
 interface IRepository {}
 class Impl implements IRepository {}
 class S { injectable dep: IRepository = new Impl(); }
-`);
+`, { staticResolution: false });
     expect(out).toContain('export const __dison_token_IRepository = Symbol("IRepository");');
     expect(out).toContain("resolveType(__dison_token_IRepository, () => (new Impl()))");
   });

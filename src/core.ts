@@ -236,7 +236,7 @@
  */
 
 import { Lexer } from "./lexer.js";
-import { collectDeclaredTypeKinds, trueInterfaceOrAliasNames, identityKeyableClassNames } from "./analysis.js";
+import { collectDeclaredTypeKinds, trueInterfaceOrAliasNames, identityKeyableClassNames, collectBlockContext } from "./analysis.js";
 import { Parser } from "./parser.js";
 import {
   generate,
@@ -250,6 +250,9 @@ import {
   type CompanionImport,
 } from "./codegen.js";
 import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE, DISON_RUNTIME_IMPORTS } from "./runtime.js";
+import { computeWiringTable, type WiringTable, type WiringDecision } from "./static-wiring.js";
+import type { Node as DisonNode } from "./ast.js";
+import { computeProjectWiring, type ProjectFileWiring } from "./static-wiring-project.js";
 import { findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
 import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo } from "./collisions.js";
 
@@ -283,6 +286,19 @@ export interface TranspileOptions {
   // ファイルでのローカル型名。複数ファイルモードでCLIが解決して渡す（単一ファイル利用
   // では空 = 外部由来の型は文字列キーにフォールバック）。
   companionImports?: Map<string, CompanionImportInfo>;
+
+  // 配線の静的解決（docs/static-resolution-design.md）。既定で有効。false で従来の
+  // 全レジストリ経由の生成に固定する（CLI の --no-static）。
+  // 単一ファイルモードではこのファイル単独の解析（computeWiringTable）で畳む。
+  // 複数ファイルモード（runtimeModulePath 指定時）は共有レジストリを介して他ファイル
+  // の配線が届くため、このファイル単独では判定できない。CLI がプロジェクト全体を
+  // 解析した結果（computeProjectWiring）を projectWiring で渡してきた場合のみ畳む。
+  staticResolution?: boolean;
+
+  // 複数ファイルモードの静的解決（フェーズ2）。CLI が computeProjectWiring で
+  // プロジェクト全体を解析し、このファイルのスライスを渡す。injectable の判定は
+  // AST 出現順で対応付ける（同じソースを同じパーサで読むため順序は決定的）。
+  projectWiring?: ProjectFileWiring;
 }
 
 /**
@@ -318,7 +334,34 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   };
 
   const strategy: KeyStrategy = { isIdentityClass, companionRefOf };
-  const body = generate(ast, fromBindings, strategy);
+
+  // 静的解決（docs/static-resolution-design.md フェーズ1）: 単一ファイルモードでのみ
+  // 適用する。複数ファイルモードは共有レジストリを介して他ファイルの配線が届くため、
+  // このファイル単独では「読む者がいない」ことを証明できない（フェーズ2で対応）。
+  const useStatic = options.staticResolution !== false && options.runtimeModulePath === undefined;
+  let wiring: WiringTable | undefined;
+  if (useStatic) {
+    const blockContext = collectBlockContext(tokens);
+    wiring = computeWiringTable(tokens, ast, strategy, (idx) => blockContext.isTopLevel(idx));
+  } else if (options.projectWiring !== undefined && options.staticResolution !== false) {
+    // 複数ファイルモード: CLI のプロジェクト解析結果をこのファイルの AST に対応付ける。
+    const pw = options.projectWiring;
+    const decisions = new Map<DisonNode, WiringDecision>();
+    let i = 0;
+    for (const n of ast) {
+      if (n.kind !== "injectable") continue;
+      const d = pw.decisionsByInjectableIndex[i++];
+      if (d !== undefined) decisions.set(n, d);
+    }
+    wiring = {
+      decisions,
+      needsRuntime: pw.needsRuntimeImport,
+      dropRegistrations: pw.dropRegistrations,
+      report: pw.report,
+    };
+  }
+
+  const body = generate(ast, fromBindings, strategy, wiring);
 
   // emit する companion = このファイルで DI利用されるローカル真 interface
   // ∪ 呼び出し側が渡した追加分（他ファイルで DI利用されるローカル宣言）。
@@ -349,10 +392,18 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   const usesLocalScope = ast.some((n) => n.kind === "configuration" && n.scope === "local");
   const header = `// --- Auto-generated TypeScript code ---\n\n`;
   const prelude = options.runtimeModulePath
-    ? `${header}import {\n` +
+    ? wiring !== undefined && !wiring.needsRuntime
+      ? // プロジェクト全体の静的解決で「このファイルは共有ランタイムに触れない」と
+        // 証明された場合、import ごと省く（docs/static-resolution-design.md §8）。
+        header
+      : `${header}import {\n` +
       `  bindTypeLazy,\n  resolveType,\n  registerOverrideLazy,\n` +
       `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScopeLazy,\n  __disonBuildFrameLazy,\n` +
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
+    : wiring !== undefined && !wiring.needsRuntime
+    ? // 静的解決が全 injectable を畳み、登録も不要と証明した場合はランタイム前置きを
+      // 一切出さない（docs/static-resolution-design.md §5。#7 のスタブ化のさらに先）。
+      header
     : usesLocalScope
     ? `${header}${DISON_RUNTIME_IMPORTS}\n${generateRuntimeDeclarations("", "node")}\n`
     : `${header}\n${generateRuntimeDeclarations("", "stub")}\n`;
@@ -365,10 +416,54 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   const fromImports = generateFromImportStatements(fromBindings);
   const companionDecls = generateCompanionDeclarations([...companionEmitNames]);
 
-  return prelude + companionImportsStr + fromImports + companionDecls + body;
+  // factory hoisting（フェーズ2）: クロスファイル勝者式の import と export
+  // （docs/static-resolution-design.md §8。式の字句的な所属ファイル側に export を
+  // 生成し、利用側のゲッターは static import した関数を直接呼ぶ）。
+  const pw = options.projectWiring;
+  const factoryImportsStr =
+    pw !== undefined && pw.factoryImports.length > 0
+      ? pw.factoryImports
+          .map(({ specifier, names }) => `import { ${names.join(", ")} } from ${JSON.stringify(specifier)};`)
+          .join("\n") + "\n\n"
+      : "";
+  // factory は const アローではなく関数宣言にする。ES Modules は関数宣言を
+  // リンク時に初期化するため、循環 import（中央設定ファイルが service を import し、
+  // service が factory を import し返す形）でも TDZ にならず、ファイル内のどの位置の
+  // 実行文からでも安全に呼べる（docs/static-resolution-design.md §8）。
+  const factoryExportsStr =
+    pw !== undefined && pw.factoryExports.length > 0
+      ? "\n\n// --- Dison static-resolution factories (referenced by other project files) ---\n" +
+        pw.factoryExports.map(({ name, expr }) => `export function ${name}() { return (${expr}); }`).join("\n") +
+        "\n"
+      : "";
+
+  return prelude + companionImportsStr + fromImports + factoryImportsStr + companionDecls + body + factoryExportsStr;
+}
+
+/**
+ * 静的解決の判定表を人間可読なレポートとして返す（CLI の --explain。
+ * docs/static-resolution-design.md §7）。transpileDisonToTS と同じ解析を単一
+ * ファイルモードで実行し、injectable ごとに「畳んだ式」または「畳めなかった理由」を
+ * 1行ずつ返す。injectable がひとつも無ければ空配列。
+ */
+export function explainWiring(sourceCode: string): string[] {
+  const tokens = new Lexer(sourceCode).tokenize();
+  const typeKinds = collectDeclaredTypeKinds(tokens);
+  const ast = new Parser(tokens, typeKinds).parseProgram();
+  const identityKeyClasses = identityKeyableClassNames(typeKinds);
+  const isIdentityClass = (id: string) => identityKeyClasses.has(id);
+  const localTrueInterfaces = trueInterfaceOrAliasNames(typeKinds);
+  const companionRefOf = (id: string): string | undefined =>
+    localTrueInterfaces.has(id) ? companionName(id) : undefined;
+  const strategy: KeyStrategy = { isIdentityClass, companionRefOf };
+  const blockContext = collectBlockContext(tokens);
+  const table = computeWiringTable(tokens, ast, strategy, (idx) => blockContext.isTopLevel(idx));
+  return table.report;
 }
 
 // 公開API: 複数ファイル対応（docs/multi-file-support.md、
 // docs/bind-interface-token.md）。CLIが複数ファイルを一括処理する際に使う。
 export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile };
+export { computeProjectWiring };
+export type { ProjectFileWiring };
 export type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo };

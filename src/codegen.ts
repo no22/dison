@@ -4,6 +4,7 @@
 
 import type { Node, OverrideEntry, BindEntry } from "./ast.js";
 import { isSimpleTypeShape, baseIdentifierOf } from "./analysis.js";
+import type { WiringTable } from "./static-wiring.js";
 
 // bind/injectable の照合キーをどう決めるかの戦略。型の種別に応じてキーが変わる。
 export interface KeyStrategy {
@@ -39,7 +40,7 @@ export function companionName(typeName: string): string {
 //      正規化済みの型名文字列。ジェネリクスは型引数の区別（Repository<User> 対
 //      Repository<Admin>）を保つため文字列が必要。外部由来の型は companion を
 //      import できないため文字列（衝突回避は従来の token/as に委ねる）。
-function keyExprFor(typeKey: string, token: string | undefined, strategy: KeyStrategy): string {
+export function keyExprFor(typeKey: string, token: string | undefined, strategy: KeyStrategy): string {
   if (token !== undefined) return token;
   const base = baseIdentifierOf(typeKey);
   if (base !== typeKey) return JSON.stringify(typeKey); // ジェネリクス等の複合型は文字列
@@ -130,8 +131,22 @@ function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy, local: 
 function generateConfiguration(
   node: Extract<Node, { kind: "configuration" }>,
   strategy: KeyStrategy,
-  scopeId: number
+  scopeId: number,
+  wiring: WiringTable | undefined
 ): string {
+  // 静的解決で「登録を読む者がいない」と証明された場合、グローバル configuration の
+  // 登録文は出力しない（ランタイム前置きごと消えるため、残すとコンパイルも通らない）。
+  // dropRegistrations が真になるのは local/class スコープが存在しないファイルだけ
+  // なので、この分岐はグローバル形（名前付き/無名）にしか到達しない。
+  if (wiring?.dropRegistrations === true && (node.scope === "global" || node.scope === "class")) {
+    if (node.scope === "global" && node.name !== undefined) {
+      // activate 呼び出し側の形（activateName()）は変えないため、空の関数を残す。
+      return `export function activate${node.name}() {\n}`;
+    }
+    // 無名グローバル / クラススコープ: 配線は畳んだゲッターに焼き込まれており、
+    // フレームを読む者はいない（L1.5）。static フィールドごと出力しない。
+    return "";
+  }
   // local と class は「フレームへ差分を積む」形（__disonBind/__disonOverride）を共有する。
   const frameForm = node.scope === "local" || node.scope === "class";
   const lines: string[] = [];
@@ -174,9 +189,30 @@ function generateConfiguration(
 
 function generateInjectable(
   node: Extract<Node, { kind: "injectable" }>,
-  strategy: KeyStrategy
+  strategy: KeyStrategy,
+  wiring: WiringTable | undefined
 ): string {
   const { propName: p, typeName: t, typeKey: k, defaultExpr, token } = node;
+
+  // 静的解決（docs/static-resolution-design.md）: 配線がトランスパイル時に確定した
+  // injectable は、レジストリを経由せず勝者式へ直接畳み込む。遅延性（式の評価は
+  // 初回アクセス時）とインスタンス単位のキャッシュは従来の形をそのまま保つ。
+  // スコープ捕捉フィールド（__dison_scope_*）は不要になるため出力しない
+  // （畳めた injectable の解決はスコープに依存しないことが証明済みのため）。
+  const decision = wiring?.decisions.get(node);
+  if (decision !== undefined && decision.kind === "static") {
+    return [
+      ``,
+      `  private _${p}?: ${t};`,
+      `  get ${p}(): ${t} {`,
+      `    if (!this._${p}) {`,
+      `      this._${p} = ${decision.expr};`,
+      `    }`,
+      `    return this._${p}!;`,
+      `  }`,
+      ``,
+    ].join("\n");
+  }
   const simpleShape = isSimpleTypeShape(k);
 
   // パーサ（parseInjectable）が「危険な型（isRiskyInjectableType）には
@@ -331,7 +367,8 @@ export function collectDiUsedTypeNames(nodes: Node[]): Set<string> {
 export function generate(
   nodes: Node[],
   fromBindings: Map<string, FromActivateBinding>,
-  strategy: KeyStrategy
+  strategy: KeyStrategy,
+  wiring?: WiringTable
 ): string {
   let out = "";
   // local/class 無名 configuration の連番（using 変数名 / static フィールド名の衝突回避）。
@@ -345,11 +382,12 @@ export function generate(
         out += generateConfiguration(
           node,
           strategy,
-          node.scope === "local" || node.scope === "class" ? scopeCounter++ : -1
+          node.scope === "local" || node.scope === "class" ? scopeCounter++ : -1,
+          wiring
         );
         break;
       case "injectable":
-        out += generateInjectable(node, strategy);
+        out += generateInjectable(node, strategy, wiring);
         break;
       case "token":
         // 複数箇所（複数ファイルにまたがる場合も含む）から安定して参照
@@ -368,10 +406,15 @@ export function generate(
       case "standalone-override":
         // configurationで包まないため関数宣言にせず、その場に直接グローバルへの
         // 代入文として出力する（書かれた位置で即座に実行される）。
-        out += generateOverrideEntryLines(node.entry, false).join("\n");
+        // 登録を読む者がいないと証明済みなら出力しない（静的解決）。
+        if (wiring?.dropRegistrations !== true) {
+          out += generateOverrideEntryLines(node.entry, false).join("\n");
+        }
         break;
       case "standalone-bind":
-        out += generateBindEntryLines(node.entry, strategy, false).join("\n");
+        if (wiring?.dropRegistrations !== true) {
+          out += generateBindEntryLines(node.entry, strategy, false).join("\n");
+        }
         break;
     }
   }

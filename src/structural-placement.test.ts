@@ -29,7 +29,7 @@ describe("構造的な位置制約", () => {
 
   it("無名configurationはクラス本体の直下に書ける（クラススコープ、docs/scoped-configuration.md フェーズ2）", () => {
     // クラス本体直下の無名 configuration は static __dison_classScope に脱糖される。
-    const out = transpileDisonToTS(`class A {}\nclass B extends A {}\nclass S { injectable a: A; configuration { bind A = B; } }`);
+    const out = transpileDisonToTS(`class A {}\nclass B extends A {}\nclass S { injectable a: A; configuration { bind A = B; } }`, { staticResolution: false });
     expect(out).toContain("static __dison_classScope_0 = __disonBuildFrameLazy(");
     expect(out).toContain("__disonBind(() => A,");
   });

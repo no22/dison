@@ -121,8 +121,9 @@ export class Parser {
             t.pos
           );
         }
+        const standalonePos = this.pos;
         const entry = this.parseOverride("a standalone override");
-        nodes.push({ kind: "standalone-override", entry });
+        nodes.push({ kind: "standalone-override", entry, tokenPos: standalonePos });
         continue;
       }
 
@@ -133,8 +134,9 @@ export class Parser {
             t.pos
           );
         }
+        const standalonePos = this.pos;
         const entry = this.parseBind("a standalone bind");
-        nodes.push({ kind: "standalone-bind", entry });
+        nodes.push({ kind: "standalone-bind", entry, tokenPos: standalonePos });
         continue;
       }
 
@@ -218,6 +220,7 @@ export class Parser {
   }
 
   private parseInjectable(): Node {
+    const startPos = this.pos; // 静的解決の囲みクラス特定用（docs/static-resolution-design.md）
     // injectable はクラスメンバ宣言（private/get/set）を生成するため、
     // クラス本体の直下（メソッドの外）以外では構文的に無効になる。
     if (!this.blockContext.isDirectClassBodyChild(this.pos)) {
@@ -265,7 +268,7 @@ export class Parser {
       );
     }
 
-    return { kind: "injectable", propName: propTok.text, typeName, typeKey, defaultExpr, token };
+    return { kind: "injectable", propName: propTok.text, typeName, typeKey, defaultExpr, token, tokenPos: startPos };
   }
 
   // "as <トークン>" 句を任意で読み取る。トークンは複数箇所（injectable/bind）から
@@ -345,6 +348,7 @@ export class Parser {
   }
 
   private parseActivate(): Node {
+    const startPos = this.pos; // 静的解決のフロー解析用（docs/static-resolution-design.md）
     // activate はただの関数呼び出し文に脱糖されるため、injectable/configuration
     // のような「宣言」と違い文が書ける場所ならどこでも良いが、クラス本体の
     // 直下（メソッドの外）だけは代入文・呼び出し文を置ける位置ではないため
@@ -404,7 +408,7 @@ export class Parser {
       );
     }
 
-    return { kind: "activate", name: nameTok.text, fromPath };
+    return { kind: "activate", name: nameTok.text, fromPath, tokenPos: startPos };
   }
 
   // 型注釈を "次のトップレベル ; または =（既定初期化式の開始）まで" 丸ごと
@@ -566,7 +570,7 @@ export class Parser {
       );
     }
 
-    return { kind: "configuration", name, scope, asyncScope, entries };
+    return { kind: "configuration", name, scope, asyncScope, entries, tokenPos: configPos };
   }
 
   // context: エラーメッセージに埋め込む文脈の説明。configuration内で呼ばれる

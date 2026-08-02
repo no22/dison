@@ -33,6 +33,10 @@ export interface BindEntry {
 
 export type ConfigEntry = OverrideEntry | BindEntry;
 
+// tokenPos: そのノードの先頭トークンの「元トークン列でのインデックス」。
+// 静的解決（docs/static-resolution-design.md）が、トップレベルのフロー解析
+// （配線文と実行文の前後関係）・囲みクラスの特定・blockContext参照に使う。
+// raw ノードには不要（静的解決はトークン列側を直接走査する）。
 export type Node =
   | { kind: "raw"; text: string }
   // configuration: name が undefined なら無名（auto-active、宣言的。
@@ -45,17 +49,17 @@ export type Node =
   // asyncScope: scope==="local" で囲み関数がasyncの場合true。脱糖形に暗黙の
   // サスペンション（await null）を挿入して呼び出し元への漏れを防ぐ
   // （docs/async-local-scope.md）。
-  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[] }
+  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[]; tokenPos?: number }
   // token: "injectable prop: Type as Token = ...;" のas句（bindと同じ役割）。
-  | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string }
+  | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string; tokenPos?: number }
   // token Name; -> export const Name = Symbol("Name"); に脱糖される
   // （docs/bind-interface-token.md）。
   | { kind: "token"; name: string }
   // fromPath: "activate Name from '...';" のfrom句（正規化済みの文字列値）。
   // 省略時（同一ファイル内 or 既にimport済みのconfigurationをactivateする
   // 場合）はundefined。
-  | { kind: "activate"; name: string; fromPath?: string }
+  | { kind: "activate"; name: string; fromPath?: string; tokenPos?: number }
   // configuration で包まない単独の override/bind。その場に書かれた位置で
   // 即座に実行される代入文として脱糖される（レキシカル変数を捕捉したい場合に使う）。
-  | { kind: "standalone-override"; entry: OverrideEntry }
-  | { kind: "standalone-bind"; entry: BindEntry };
+  | { kind: "standalone-override"; entry: OverrideEntry; tokenPos?: number }
+  | { kind: "standalone-bind"; entry: BindEntry; tokenPos?: number };

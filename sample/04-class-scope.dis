@@ -1,0 +1,52 @@
+// Class-scope configuration: an anonymous `configuration { ... }`
+// directly inside a class body is that class's own declarative wiring,
+// inherited by subclasses. Static resolution (2.0) folds it too: the
+// class scope is lexical — it can only ever affect instances of the
+// class (and its subclasses) it is written in — so the winner is known
+// at transpile time and the frame machinery disappears entirely.
+//
+// Note the precision: `Analytics` below uses the same `Store` type,
+// but `Reporting`'s class scope does NOT leak into it. Each class gets
+// exactly the wiring its own prototype chain declares.
+//
+// Run it:
+//   npx dison sample/04-class-scope.dis
+//   npx tsx sample/04-class-scope.ts
+//   npx dison --explain sample/04-class-scope.dis
+
+class Store {
+  kind = "sql";
+}
+
+class MemoryStore extends Store {
+  kind = "memory";
+}
+
+// Reporting wires its own dependency: every Reporting (and subclass)
+// instance resolves Store to MemoryStore...
+class Reporting {
+  injectable store: Store;
+  configuration { bind Store = MemoryStore; }
+
+  describe(): string {
+    return `reporting on ${this.store.kind}`;
+  }
+}
+
+// ...including inherited resolution in subclasses (the class scope is
+// part of the prototype chain)...
+class WeeklyReporting extends Reporting {}
+
+// ...while an unrelated class using the same Store type is untouched
+// and keeps the default.
+class Analytics {
+  injectable store: Store;
+
+  describe(): string {
+    return `analytics on ${this.store.kind}`;
+  }
+}
+
+console.log(new Reporting().describe());       // reporting on memory
+console.log(new WeeklyReporting().describe()); // reporting on memory
+console.log(new Analytics().describe());       // analytics on sql

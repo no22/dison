@@ -12,7 +12,7 @@ configuration Cfg {
     dep = Mock;
   }
 }
-`);
+`, { staticResolution: false });
     expect(out).toContain('registerOverrideLazy(() => S, "dep", () => (Mock));');
   });
 
@@ -27,7 +27,7 @@ configuration Cfg {
     dep = new Service();
   }
 }
-`);
+`, { staticResolution: false });
     expect(out).toContain("registerOverrideLazy(() => Servcie,");
   });
 });
@@ -40,7 +40,7 @@ class Mock {}
 configuration Cfg {
   bind Real = Mock;
 }
-`);
+`, { staticResolution: false });
     // Real / Mock はどちらも具象クラスなので、"Real"/"Mock" ではなくクラスの
     // 実体参照そのものがキーになる。これにより複数ファイルで同名クラスが
     // 衝突しなくなる（手動tokenが不要）。
@@ -53,7 +53,7 @@ class Real {}
 class Mock {}
 class S { injectable dep: Real; }
 configuration Cfg { bind Real = Mock; }
-`);
+`, { staticResolution: false });
     // injectable側 resolveType のキーも bind側 bindType のキーも同じ実体 Real。
     expect(out).toContain("resolveType(Real, () => new Real())");
     expect(out).toContain("bindTypeLazy<Real>(() => Real,");
@@ -64,7 +64,7 @@ configuration Cfg { bind Real = Mock; }
 interface IRepo {}
 class Impl implements IRepo {}
 configuration Cfg { bind IRepo = Impl; }
-`);
+`, { staticResolution: false });
     // 左辺 IRepo は interface なので companion Symbol（宣言に対し自動生成）をキーに、
     // 差し替え先 Impl は具象クラスなので実体キー。DI利用されるので companion が emit される。
     expect(out).toContain('export const __dison_token_IRepo = Symbol("IRepo");');
@@ -78,7 +78,7 @@ class Real extends Repo { who() { return "r"; } }
 class Mock extends Repo { who() { return "m"; } }
 class S { injectable dep: Repo = new Real(); }
 configuration Cfg { bind Repo = Mock; }
-`);
+`, { staticResolution: false });
     // abstract class は new 不可だが値を持つため実体キー（companion は生成しない）。
     expect(out).not.toContain("__dison_token_Repo");
     expect(out).toContain("resolveType(Repo, () => (new Real()))");
@@ -103,7 +103,7 @@ describe("bind: コンストラクタ引数（docs/bind-constructor-arguments.md
 class Base {}
 class WithConn extends Base { constructor(c: string) { super(); } }
 configuration Cfg { bind Base = WithConn("prod://db"); }
-`);
+`, { staticResolution: false });
     expect(out).toContain('resolveType(WithConn, () => new WithConn("prod://db"))');
   });
 
@@ -122,7 +122,7 @@ configuration Cfg { bind Base = Plain; bind Base = Plain(); }
 class Base {}
 class Factory extends Base { constructor(make: () => number, opts: { n: number }) { super(); } }
 configuration Cfg { bind Base = Factory(() => 1 + 2, { n: 3 }); }
-`);
+`, { staticResolution: false });
     expect(out).toContain("new Factory(() => 1 + 2, { n: 3 })");
   });
 
@@ -131,7 +131,7 @@ configuration Cfg { bind Base = Factory(() => 1 + 2, { n: 3 }); }
 interface Repo<T> { get(): T; }
 class PgRepo<T> implements Repo<T> { constructor(dsn: string) {} get(): T { return null as any; } }
 configuration Cfg { bind Repo<string> = PgRepo<string>("dsn"); }
-`);
+`, { staticResolution: false });
     expect(out).toContain('new PgRepo<string>("dsn")');
   });
 
@@ -169,7 +169,7 @@ token IRepoToken;
 interface IRepo {}
 class Impl implements IRepo { constructor(x: number) {} }
 configuration Cfg { bind IRepo as IRepoToken = Impl(42); }
-`);
+`, { staticResolution: false });
     expect(out).toContain("bindTypeLazy<IRepo>(() => IRepoToken, () => resolveType(Impl, () => new Impl(42)))");
   });
 
@@ -189,7 +189,7 @@ class S { injectable dep: Repository<{ id: string }> = new Impl(); }
 configuration Cfg {
   bind Repository<{ id: string }> = Impl;
 }
-`);
+`, { staticResolution: false });
     expect(out).toContain("bindTypeLazy<Repository<{ id: string }>>(");
   });
 
@@ -202,7 +202,7 @@ configuration Cfg {
   bind Repository<{ kind: "user" }> = UserImpl;
   bind Repository<{ kind: "admin" }> = AdminImpl;
 }
-`);
+`, { staticResolution: false });
     const keys = extractKeys(out);
     expect(keys).toContain('Repository<{kind:"user"}>');
     expect(keys).toContain('Repository<{kind:"admin"}>');
@@ -215,7 +215,7 @@ class ConcreteHandler<T> extends Handler<T> {}
 configuration Cfg {
   bind Handler<(x: number) => void> = ConcreteHandler;
 }
-`);
+`, { staticResolution: false });
     expect(out).toContain("bindTypeLazy<Handler<(x: number) => void>>(");
   });
 });
@@ -231,7 +231,7 @@ class S {
 configuration Cfg {
   bind Repository<{id:string}> = Impl;
 }
-`);
+`, { staticResolution: false });
     // injectable側のresolveTypeキー、bind側のbindType原型キーの両方が
     // 同じ正規化済み文字列になっているはず（bindの差し替え先Implの
     // resolveTypeキーは別に1件あるので、それを含めて数えないよう
@@ -259,7 +259,7 @@ describe("単独のoverride/bind（configurationで包まない）", () => {
 class Base { name = "default"; }
 class Mock extends Base { name = "mock"; }
 bind Base = Mock;
-`);
+`, { staticResolution: false });
     expect(out).toContain('bindTypeLazy<Base>(() => Base, () => resolveType(Mock, () => new Mock()));');
     expect(out).not.toContain("function activate");
   });

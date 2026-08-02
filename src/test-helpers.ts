@@ -8,8 +8,8 @@ import { transpileDisonToTS } from "./core.js";
 // ため、esbuildのcjs変換後の require("node:async_hooks") を解決できるよう require を
 // 渡す。using（Symbol.dispose）も esbuild が down-level し、Node実行時に動作する。
 const nodeRequire = createRequire(import.meta.url);
-export function runGenerated(disonSource: string): any {
-  const ts = transpileDisonToTS(disonSource);
+export function runGenerated(disonSource: string, options?: Parameters<typeof transpileDisonToTS>[1]): any {
+  const ts = transpileDisonToTS(disonSource, options);
   const { code } = transformSync(ts, { loader: "ts", format: "cjs", target: "node20" });
   const mod: { exports: any } = { exports: {} };
   const fn = new Function("module", "exports", "require", code);

@@ -120,7 +120,7 @@ describe("クラススコープ configuration（docs/scoped-configuration.md フ
 class Db {}
 class ClassDb extends Db {}
 class S { injectable db: Db; configuration { bind Db = ClassDb; } }
-`);
+`, { staticResolution: false });
     expect(out).toContain("static __dison_classScope_0 = __disonBuildFrameLazy((__disonBind, __disonOverride) => {");
     expect(out).toContain("__disonBind(() => Db, (): Db => resolveType(ClassDb, () => new ClassDb()));");
   });
@@ -230,7 +230,7 @@ module.exports = { v: (new S() as any).dep.n() };
 class Base {}
 class Mock extends Base {}
 configuration { bind Base = Mock; }
-`);
+`, { staticResolution: false });
     // 関数化されず、その場に即時のグローバル bindType 呼び出しが出る（using脱糖はしない）。
     expect(out).toContain("bindTypeLazy<Base>(() => Base, () => resolveType(Mock, () => new Mock()));");
     expect(out).not.toContain("function activate");

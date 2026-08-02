@@ -2,16 +2,27 @@ import { describe, it, expect } from "vitest";
 import { transpileDisonToTS, DISON_RUNTIME_MODULE_SOURCE } from "./core";
 
 describe("複数ファイル対応フェーズ1（docs/multi-file-support.md）", () => {
-  it("既定（オプション省略）ではランタイムをインライン生成する", () => {
-    const out = transpileDisonToTS(`class Foo {}\nclass S { injectable dep: Foo; }`);
+  it("既定（オプション省略）では、ランタイムが必要ならインライン生成する（importしない）", () => {
+    // 静的解決（docs/static-resolution-design.md）が既定で有効なため、ランタイムが
+    // 必要になる形（ローカルスコープ）を含むソースで「インライン生成」を確認する。
+    const out = transpileDisonToTS(
+      `class Foo {}\nclass S { injectable dep: Foo; }\nfunction f() {\n  configuration { bind Foo = Foo; }\n  return new S();\n}`
+    );
     // ランタイムの宣言本体がインラインされる（関数定義がある）。
     expect(out).toContain("const DI_REGISTRY = new WeakMap");
     expect(out).toContain("function __disonEnterScope");
-    // ローカルスコープを使わないファイルは AsyncLocalStorage の同期スタブでインライン
-    // 生成され、node:async_hooks への import は付かない（監査#7）。ランタイム本体を
-    // 別モジュールから import もしない。
-    expect(out).not.toContain("node:async_hooks");
+    // ランタイム本体を別モジュールから import はしない。
     expect(out).not.toMatch(/} from "\.\//);
+  });
+
+  it("静的解決が全 injectable を畳んだファイルは、ランタイム前置きを一切出さない", () => {
+    // 配線が無い（または宣言的ヘッダに収まる）ファイルは L0/L1 で全部畳まれ、
+    // レジストリもスタブも出力されない（docs/static-resolution-design.md §5）。
+    const out = transpileDisonToTS(`class Foo {}\nclass S { injectable dep: Foo; }`);
+    expect(out).toContain("this._dep = new Foo();");
+    expect(out).not.toContain("DI_REGISTRY");
+    expect(out).not.toContain("__disonResolveInjectable");
+    expect(out).not.toContain("node:async_hooks");
   });
 
   it("runtimeModulePathを指定すると、ランタイム本体はインラインせずそのパスからimportする", () => {

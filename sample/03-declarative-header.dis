@@ -1,0 +1,67 @@
+// The "declarative header" style, and what static resolution (new in
+// 2.0) makes of it: when every configuration sits above the first
+// executable statement, the transpiler can prove the winner of each
+// injectable at compile time and folds it straight into the getter.
+// The generated file contains NO registry, NO runtime helpers — just
+// your classes and plain `new` expressions. It runs anywhere
+// (browser, edge, Node), because there is nothing left to depend on.
+//
+// Run it:
+//   npx dison sample/03-declarative-header.dis
+//   npx tsx sample/03-declarative-header.ts
+//
+// Ask the transpiler what it decided (and why) with:
+//   npx dison --explain sample/03-declarative-header.dis
+
+// --- wiring first (the declarative header) -------------------------
+
+configuration { bind Repository = CachedRepository; }
+configuration { bind Clock = FixedClock("2026-08-02T00:00:00Z"); }
+
+// --- declarations --------------------------------------------------
+// Configurations may forward-reference these classes (since 1.5.0),
+// so the wiring really can sit at the very top of the file.
+
+class Repository {
+  find(id: string) {
+    return { id, source: "db" };
+  }
+}
+
+class CachedRepository extends Repository {
+  find(id: string) {
+    return { id, source: "cache" };
+  }
+}
+
+class Clock {
+  now(): string {
+    return new Date().toISOString();
+  }
+}
+
+class FixedClock extends Clock {
+  constructor(private readonly at: string) {
+    super();
+  }
+  now(): string {
+    return this.at;
+  }
+}
+
+class ReportService {
+  injectable repo: Repository;
+  injectable clock: Clock;
+
+  render(id: string): string {
+    const row = this.repo.find(id);
+    return `[${this.clock.now()}] ${row.id} from ${row.source}`;
+  }
+}
+
+// --- use -----------------------------------------------------------
+// Look at the generated getters: `this._repo = new CachedRepository();`
+// and `this._clock = new FixedClock("...");` — the bind chain and its
+// constructor arguments were resolved at transpile time.
+
+console.log(new ReportService().render("42"));
