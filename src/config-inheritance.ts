@@ -107,6 +107,24 @@ export function flattenConfiguration<F>(
   const visiting: string[] = [];
 
   const walk = (n: ConfigurationNode, f: F, origin: string | undefined): void => {
+    // 実行時選択の葉は「どれが選ばれるか不明」なので、解析上は全葉を合併して扱う
+    // （静的解決側は全葉を動的 taint にする。docs/activate-sugar-implementation.md §1.4）。
+    for (const sel of n.extendsSelections ?? []) {
+      for (const leaf of sel.leaves) {
+        if (visiting.includes(leaf)) continue;
+        const decl = resolve(leaf, f);
+        if (decl === undefined) {
+          pushDiag(
+            `configuration "${leaf}" in an "extends (...)" selection could not be resolved. ` +
+              `Declare it in this file, or pass the file that declares it to the CLI as well.`
+          );
+          continue;
+        }
+        visiting.push(leaf);
+        walk(decl.node, decl.file, leaf);
+        visiting.pop();
+      }
+    }
     for (const parentName of n.extendsNames ?? []) {
       if (visiting.includes(parentName)) {
         pushDiag(
@@ -214,6 +232,11 @@ export function configurationsNeedingApplier(
   };
   for (const node of ast) {
     if (node.kind !== "configuration") continue;
+    // 実行時選択（extends (...)）は葉を**値として**参照するため、位置がグローバルでも
+    // applier が要る（docs/activate-sugar-implementation.md §1.3）。
+    for (const sel of node.extendsSelections ?? []) {
+      for (const leaf of sel.leaves) addWithAncestors(leaf, []);
+    }
     if (node.scope === "global") continue; // グローバル展開は activateX() で足りる
     for (const name of node.extendsNames ?? []) addWithAncestors(name, []);
   }

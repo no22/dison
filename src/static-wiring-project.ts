@@ -625,9 +625,9 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
     for (const node of fa.ast) {
       const flat: { entry: ConfigEntry; fa: FileAnalysis }[] =
         node.kind === "configuration"
-          ? node.extendsNames === undefined
+          ? node.extendsNames === undefined && node.extendsSelections === undefined
             ? node.entries.map((entry) => ({ entry, fa }))
-            : flattenProject(node, fa)
+            : flattenProject(node, fa) // 閉包は保守的に全葉を合併して見る
           : node.kind === "standalone-bind" || node.kind === "standalone-override"
           ? [{ entry: node.entry, fa }]
           : [];
@@ -811,10 +811,25 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
     for (const node of fa.ast) {
       const pos = (node as { tokenPos?: number }).tokenPos ?? 0;
       if (node.kind === "configuration") {
+        // 実行時選択（docs/activate-sugar-implementation.md §1.4）: 全葉を動的 taint。
+        if (node.extendsSelections !== undefined) {
+          for (const sel of node.extendsSelections) {
+            const cands = sel.leaves.join(", ");
+            for (const leaf of sel.leaves) {
+              const decl = resolveConfig(leaf, fa);
+              if (decl === undefined) continue;
+              taintFlat(
+                flattenProject(decl.node, decl.file),
+                `configuration selected at runtime among {${cands}}`
+              );
+            }
+          }
+          dynamicContextWiring = true;
+        }
         const effective =
-          node.extendsNames === undefined
+          node.extendsNames === undefined && node.extendsSelections === undefined
             ? node.entries.map((entry) => ({ entry, fa }))
-            : flattenProject(node, fa);
+            : flattenProject({ ...node, extendsSelections: undefined }, fa);
         if (node.scope === "local") {
           taintFlat(effective, "bound in a local scope");
         } else if (node.scope === "class") {

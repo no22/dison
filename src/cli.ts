@@ -22,7 +22,10 @@ function outputPathFor(inputFile: string): string {
 // 必要が無い、これまで通りの使い方。
 function transpileSingleFile(inputFile: string, opts: CliOptions): void {
   const sourceCode = fs.readFileSync(inputFile, 'utf-8');
-  const generatedTS = transpileDisonToTS(sourceCode, { staticResolution: !opts.noStatic });
+  const generatedTS = transpileDisonToTS(sourceCode, {
+    staticResolution: !opts.noStatic,
+    onWarning: (m) => console.warn(`⚠️  ${inputFile}: ${m}`),
+  });
   const outputFile = outputPathFor(inputFile);
   fs.writeFileSync(outputFile, generatedTS, 'utf-8');
   console.log(`🎉 Success: ${inputFile} ➔ ${outputFile}`);
@@ -143,6 +146,7 @@ function transpileMultipleFiles(inputFiles: string[], opts: CliOptions): void {
       projectWiring: projectWiring?.get(file.path),
       configApplierEmit: configExtendsPlanByFile.get(file.path)?.applierEmit,
       configExtendsImports: configExtendsPlanByFile.get(file.path)?.extendsImports,
+      onWarning: (m) => console.warn(`⚠️  ${file.path}: ${m}`),
     });
     const outputFile = outputPathFor(file.path);
     fs.writeFileSync(outputFile, generatedTS, 'utf-8');

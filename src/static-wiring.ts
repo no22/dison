@@ -842,6 +842,16 @@ export function computeWiringTable(
   // configuration の継承（docs/configuration-inheritance.md）: 解析は平坦化済みの
   // 実効エントリ列に対して行う。単一ファイルなので親はローカル宣言のみ解決できる
   // （解決できない親は無視 = そのエントリは見えない → 保守的に畳まない方向に働く）。
+  // 選択形の葉を除いた実効エントリ（葉は上で個別に taint 済み。合併して静的勝者に
+  // 混ぜると「実行時に選ばれなかった方」も勝者候補になってしまう）。
+  const flattenLocalOwn = (n: Extract<Node, { kind: "configuration" }>): ConfigEntry[] =>
+    n.extendsNames === undefined
+      ? n.entries
+      : flattenConfiguration<undefined>({ ...n, extendsSelections: undefined }, undefined, (name) => {
+          const decl = namedConfigs.get(name);
+          return decl !== undefined ? { node: decl, file: undefined } : undefined;
+        }).entries.map((fe) => fe.entry);
+
   const flattenLocal = (n: Extract<Node, { kind: "configuration" }>): ConfigEntry[] =>
     flattenConfiguration<undefined>(n, undefined, (name) => {
       const decl = namedConfigs.get(name);
@@ -934,9 +944,9 @@ export function computeWiringTable(
   for (const node of ast) {
     const entries: ConfigEntry[] =
       node.kind === "configuration"
-        ? node.extendsNames === undefined
+        ? node.extendsNames === undefined && node.extendsSelections === undefined
           ? node.entries
-          : flattenLocal(node)
+          : flattenLocal(node) // 閉包は保守的に全葉を合併して見る
         : node.kind === "standalone-bind" || node.kind === "standalone-override"
         ? [node.entry]
         : [];
@@ -1069,7 +1079,23 @@ export function computeWiringTable(
   for (const node of ast) {
     const pos = (node as { tokenPos?: number }).tokenPos ?? 0;
     if (node.kind === "configuration") {
-      const effective = node.extendsNames === undefined ? node.entries : flattenLocal(node);
+      // 実行時選択（extends (...)）: どの葉が選ばれるかは実行時に決まるので、
+      // 全葉のエントリを動的 taint にする（docs/activate-sugar-implementation.md §1.4）。
+      if (node.extendsSelections !== undefined) {
+        for (const sel of node.extendsSelections) {
+          const cands = sel.leaves.join(", ");
+          for (const leaf of sel.leaves) {
+            const decl = namedConfigs.get(leaf);
+            if (decl === undefined) continue;
+            taintEntries(flattenLocal(decl), `configuration selected at runtime among {${cands}}`);
+          }
+        }
+        dynamicContextWiring = true;
+      }
+      const effective =
+        node.extendsNames === undefined && node.extendsSelections === undefined
+          ? node.entries
+          : flattenLocalOwn(node);
       if (node.scope === "local") {
         localScopesExist = true;
         taintEntries(effective, "bound in a local scope");

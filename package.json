@@ -1,6 +1,6 @@
 {
   "name": "@no22/dison",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
   "description": "An experimental DSL that transpiles to TypeScript, with property injection built into the language itself.",
   "main": "./dist/core.js",

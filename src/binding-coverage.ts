@@ -158,7 +158,28 @@ export function findUnboundInjectables(files: DisonFileInput[]): BindCollisionDi
       const pos = (node as { tokenPos?: number }).tokenPos ?? 0;
       if (node.kind === "configuration") {
         const flat =
-          node.extendsNames === undefined ? node.entries.map((entry) => ({ entry, fs })) : flatten(node, fs);
+          node.extendsNames === undefined && node.extendsSelections === undefined
+            ? node.entries.map((entry) => ({ entry, fs }))
+            : flatten({ ...node, extendsSelections: undefined }, fs);
+        // 実行時選択は「どの葉が選ばれても束縛される」キーだけが保証される。
+        // 全葉の平坦化結果の**積集合**を取る（docs/activate-sugar-implementation.md §1.5）。
+        if (node.extendsSelections !== undefined && node.scope === "global" && node.name === undefined) {
+          for (const sel of node.extendsSelections) {
+            const perLeaf = sel.leaves.map((leaf) => {
+              const decl = resolveConfig(leaf, fs);
+              return decl === undefined ? [] : flatten(decl.node, decl.file);
+            });
+            if (perLeaf.length === 0 || perLeaf.some((l) => l.length === 0)) continue;
+            const keyOf = (x: { entry: ConfigEntry; fs: FileState }): string =>
+              x.entry.kind === "bind"
+                ? `bind ${declSiteOf(x.fs, baseIdentifierOf(x.entry.originalTypeKey), byNorm)}${x.entry.token ?? ""}`
+                : `override ${declSiteOf(x.fs, x.entry.className, byNorm)}`;
+            const common = perLeaf[0].filter((x) =>
+              perLeaf.every((leafEntries) => leafEntries.some((y) => keyOf(y) === keyOf(x)))
+            );
+            addGlobal(common);
+          }
+        }
         if (node.scope === "global" && node.name === undefined) {
           addGlobal(flat); // 1・4: 無名グローバル（extends 付きも含む）は auto-active
         } else if (node.scope === "class") {

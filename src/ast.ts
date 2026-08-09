@@ -57,7 +57,20 @@ export type Node =
   // エントリを取り込む。無名に付けた場合は「その位置への展開」になる。
   // entries は書かれたとおりを保持し、平坦化はしない（パーサは他ファイルの
   // 親を解決できないため。平坦化は config-inheritance.ts が行う）。
-  | { kind: "configuration"; name?: string; extendsNames?: string[]; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[]; tokenPos?: number }
+  // extendsSelections: `configuration extends (cond ? A : B) { ... }` の実行時選択
+  // （docs/activate-sugar-implementation.md §1）。文法は「条件木で葉は configuration
+  // 名」に限定してあるため、候補集合（leaves）が静的に確定する。exprTemplate は
+  // 葉を "{0}" "{1}" … に置換した条件式で、生成時に applier 参照へ埋め戻す。
+  | {
+      kind: "configuration";
+      name?: string;
+      extendsNames?: string[];
+      extendsSelections?: { leaves: string[]; exprTemplate: string }[];
+      scope: "global" | "local" | "class";
+      asyncScope?: boolean;
+      entries: ConfigEntry[];
+      tokenPos?: number;
+    }
   // token: "injectable prop: Type as Token = ...;" のas句（bindと同じ役割）。
   | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string; tokenPos?: number }
   // token Name; -> export const Name = Symbol("Name"); に脱糖される

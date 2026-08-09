@@ -183,9 +183,24 @@ export class Parser {
     // configuration 宣言とみなす。それ以外の記号（"=", "?", "." 等）が現れたら、
     // 単に "configuration" という名前の変数・メソッドが使われているだけと判断して
     // raw パススルーに落とす。
-    const MAX_LOOKAHEAD = 32;
+    // 実行時選択 "extends (条件木)" では括弧グループが挟まる
+    // （docs/activate-sugar-implementation.md §1.2）。括弧の中は任意の TS 式なので
+    // 深さを数えて丸ごと読み飛ばし、その外側では ident と "," だけを許す。
+    const MAX_LOOKAHEAD = 512;
+    let depth = 0;
     for (let i = 1; i <= MAX_LOOKAHEAD; i++) {
       const t = this.peekSignificant(i);
+      if (t.type === "eof") return false;
+      if (t.type === "punct" && (t.text === "(" || t.text === "[")) {
+        depth++;
+        continue;
+      }
+      if (t.type === "punct" && (t.text === ")" || t.text === "]")) {
+        depth--;
+        if (depth < 0) return false;
+        continue;
+      }
+      if (depth > 0) continue; // 括弧の中は任意の式
       if (t.type === "punct" && t.text === "{") return true;
       if (t.type === "ident") continue;
       if (t.type === "punct" && t.text === ",") continue;
@@ -572,16 +587,31 @@ export class Parser {
     }
 
     // "extends A, B" 節（任意）。名前で参照した configuration のエントリを取り込む。
+    // 各項は「configuration 名」または「(条件木)」（実行時選択。
+    // docs/activate-sugar-implementation.md §1.2）。
     let extendsNames: string[] | undefined;
+    let extendsSelections: { leaves: string[]; exprTemplate: string }[] | undefined;
     if (this.peek().type === "ident" && this.peek().text === "extends") {
       const extendsTok = this.next(); // 'extends'
       this.skipTrivia();
       const names: string[] = [];
+      const selections: { leaves: string[]; exprTemplate: string }[] = [];
       while (true) {
         const t = this.peek();
+        if (t.type === "punct" && t.text === "(") {
+          selections.push(this.parseExtendsSelection());
+          this.skipTrivia();
+          const sep2 = this.peek();
+          if (sep2.type === "punct" && sep2.text === ",") {
+            this.next();
+            this.skipTrivia();
+            continue;
+          }
+          break;
+        }
         if (t.type !== "ident") {
           throw new DisonParseError(
-            `Expected a configuration name after "extends" but found "${t.text}"`,
+            `Expected a configuration name or "(" after "extends" but found "${t.text}"`,
             t.pos
           );
         }
@@ -595,6 +625,7 @@ export class Parser {
         }
         break;
       }
+      if (selections.length > 0) extendsSelections = selections;
       const dup = names.find((n, i) => names.indexOf(n) !== i);
       if (dup !== undefined) {
         throw new DisonParseError(`configuration "${dup}" is listed twice in the same "extends" clause`, extendsTok.pos);
@@ -608,7 +639,14 @@ export class Parser {
         // configuration は import 不要で参照でき、必要な import は生成側が注入する。
         // docs/configuration-inheritance.md §3.2）。
       }
-      extendsNames = names;
+      extendsNames = names.length > 0 ? names : undefined;
+      for (const sel of selections) {
+        for (const leaf of sel.leaves) {
+          if (leaf === name) {
+            throw new DisonParseError(`configuration "${leaf}" cannot extend itself`, extendsTok.pos);
+          }
+        }
+      }
     }
     // フェーズ1/2: 名前付きローカル/クラス configuration（+ その activate）は未対応。
     if (scope !== "global" && name !== undefined) {
@@ -647,7 +685,116 @@ export class Parser {
       );
     }
 
-    return { kind: "configuration", name, extendsNames, scope, asyncScope, entries, tokenPos: configPos };
+    return { kind: "configuration", name, extendsNames, extendsSelections, scope, asyncScope, entries, tokenPos: configPos };
+  }
+
+  // "(条件木)" をパースする（実行時選択。docs/activate-sugar-implementation.md §1.2）。
+  //
+  //   selection := IDENT | <任意のTS式> "?" selection ":" selection
+  //
+  // 葉は必ず configuration 名、条件部分は任意の TS 式（raw パススルー）。
+  // 文法をこの形に限定することで**候補集合（葉）が静的に確定**し、applier の emit
+  // 計画・被覆チェックの積集合推論・クロスファイル import が従来どおり成立する。
+  //
+  // 返り値の exprTemplate は葉を "{0}" "{1}" … に置換したもので、生成側が
+  // applier 参照（__dison_config_X）へ埋め戻す。
+  private parseExtendsSelection(): { leaves: string[]; exprTemplate: string } {
+    const openTok = this.next(); // '('
+    // 対応する ')' までのトークンを深さを数えて集める。
+    const inner: Token[] = [];
+    let depth = 1;
+    while (true) {
+      const t = this.peek();
+      if (t.type === "eof") {
+        throw new DisonParseError(`Closing ")" for the "extends (...)" selection not found`, openTok.pos);
+      }
+      if (t.type === "punct" && (t.text === "(" || t.text === "[" || t.text === "{")) depth++;
+      if (t.type === "punct" && (t.text === ")" || t.text === "]" || t.text === "}")) {
+        depth--;
+        if (depth === 0) {
+          this.next(); // ')'
+          break;
+        }
+      }
+      inner.push(this.next());
+    }
+
+    const leaves: string[] = [];
+    const significant = (ts: Token[]): Token[] => ts.filter((t) => !this.isTrivia(t));
+
+    // トークン列を条件木として分解する。深さ0の最初の '?' を見つけ、対応する ':' で
+    // 二分する（条件部分に三項演算子が入れ子になっていても正しく対応が取れる）。
+    const build = (ts: Token[]): string => {
+      const sig = significant(ts);
+      if (sig.length === 0) {
+        throw new DisonParseError(`An empty branch in the "extends (...)" selection`, openTok.pos);
+      }
+      let depth2 = 0;
+      let qIdx = -1;
+      for (let i = 0; i < ts.length; i++) {
+        const t = ts[i];
+        if (t.type !== "punct") continue;
+        if (t.text === "(" || t.text === "[" || t.text === "{") depth2++;
+        else if (t.text === ")" || t.text === "]" || t.text === "}") depth2--;
+        else if (t.text === "?" && depth2 === 0) {
+          qIdx = i;
+          break;
+        }
+      }
+      if (qIdx === -1) {
+        // 葉: 単一の configuration 名でなければならない。
+        if (sig.length !== 1 || sig[0].type !== "ident") {
+          throw new DisonParseError(
+            `Each branch of an "extends (...)" selection must be a single configuration name, but found "${sig
+              .map((t) => t.text)
+              .join("")}"`,
+            openTok.pos
+          );
+        }
+        leaves.push(sig[0].text);
+        return `{${leaves.length - 1}}`;
+      }
+      // qIdx に対応する ':' を探す（入れ子の '?' を数える）。
+      let depth3 = 0;
+      let pending = 0;
+      let cIdx = -1;
+      for (let i = qIdx + 1; i < ts.length; i++) {
+        const t = ts[i];
+        if (t.type !== "punct") continue;
+        if (t.text === "(" || t.text === "[" || t.text === "{") depth3++;
+        else if (t.text === ")" || t.text === "]" || t.text === "}") depth3--;
+        else if (t.text === "?" && depth3 === 0) pending++;
+        else if (t.text === ":" && depth3 === 0) {
+          if (pending === 0) {
+            cIdx = i;
+            break;
+          }
+          pending--;
+        }
+      }
+      if (cIdx === -1) {
+        throw new DisonParseError(`A "?" without a matching ":" in the "extends (...)" selection`, openTok.pos);
+      }
+      const cond = ts
+        .slice(0, qIdx)
+        .map((t) => t.text)
+        .join("")
+        .trim();
+      if (cond === "") {
+        throw new DisonParseError(`An empty condition in the "extends (...)" selection`, openTok.pos);
+      }
+      return `${cond} ? ${build(ts.slice(qIdx + 1, cIdx))} : ${build(ts.slice(cIdx + 1))}`;
+    };
+
+    const exprTemplate = build(inner);
+    const dup = leaves.find((n, i) => leaves.indexOf(n) !== i);
+    if (dup !== undefined) {
+      throw new DisonParseError(
+        `configuration "${dup}" appears twice in the same "extends (...)" selection`,
+        openTok.pos
+      );
+    }
+    return { leaves, exprTemplate };
   }
 
   // context: エラーメッセージに埋め込む文脈の説明。configuration内で呼ばれる

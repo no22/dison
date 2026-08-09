@@ -310,6 +310,10 @@ export interface TranspileOptions {
   // activateX を import する。
   configExtendsImports?: Map<string, { specifier: string; needsApplier: boolean }>;
 
+  // 警告の受け取り口（docs/activate-sugar-implementation.md §1.6）。省略時は何もしない。
+  // 3.0 で意味が変わる書き方（非トップレベルの activate）を事前に知らせるために使う。
+  onWarning?: (message: string) => void;
+
   // 複数ファイルモードの静的解決（フェーズ2）。CLI が computeProjectWiring で
   // プロジェクト全体を解析し、このファイルのスライスを渡す。injectable の判定は
   // AST 出現順で対応付ける（同じソースを同じパーサで読むため順序は決定的）。
@@ -375,6 +379,25 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
       report: pw.report,
       classMemberInjections: new Map(pw.classMemberInjections ?? []),
     };
+  }
+
+  // 移行警告（3.0 予告）: 非トップレベルの activate は 3.0 で「その位置への展開」に
+  // 意味が変わる（docs/activate-as-sugar-v3.md）。2.3 では挙動を変えず警告のみ。
+  if (options.onWarning !== undefined) {
+    const blockContextForWarn = collectBlockContext(tokens);
+    for (const node of ast) {
+      if (node.kind !== "activate") continue;
+      const pos = node.tokenPos ?? 0;
+      if (blockContextForWarn.isTopLevel(pos)) continue;
+      options.onWarning(
+        `"activate ${node.name}" is inside a block. Today it registers globally, but in Dison 3.0 ` +
+          `activate will mean "splice this configuration here", so its scope will follow where it is ` +
+          `written and this one would be undone at the end of the block. ` +
+          `Write "configuration extends ${node.name} {}" if you want the block-scoped meaning, ` +
+          `or move it to the top level / select at runtime with ` +
+          `"configuration extends (cond ? ${node.name} : Other) {}" if you want it to apply globally.`
+      );
+    }
   }
 
   // configuration の継承（docs/configuration-inheritance.md）。ローカル/クラススコープへ

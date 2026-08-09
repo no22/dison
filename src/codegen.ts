@@ -180,6 +180,16 @@ function generateConfiguration(
         : `  activate${parent}();`
     );
   }
+  // 実行時選択（docs/activate-sugar-implementation.md §1.3）: applier を値として選ぶ。
+  // グローバル位置は __disonApplyToGlobal に、フレーム位置はコールバックに直接渡す。
+  for (const sel of node.extendsSelections ?? []) {
+    const expr = sel.exprTemplate.replace(/\{(\d+)\}/g, (_m, i) => configApplierName(sel.leaves[Number(i)]));
+    lines.push(
+      frameForm
+        ? `  (${expr})(__disonBind, __disonOverride);`
+        : `  __disonApplyToGlobal(${expr});`
+    );
+  }
   for (const entry of node.entries) {
     if (entry.kind === "override") {
       lines.push(...generateOverrideEntryLines(entry, frameForm));

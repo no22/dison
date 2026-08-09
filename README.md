@@ -160,6 +160,25 @@ same key, that is a build error rather than a silent coin flip — the child
 must wire it explicitly to say which one it wants. Cycles are a build error
 too.
 
+#### Selecting a configuration at runtime (new in 2.3)
+
+A parenthesised conditional picks between named configurations at runtime,
+while keeping the wiring a single declarative statement:
+
+```dison
+configuration extends (isTest ? Test : Production) {}
+configuration extends (mode === "dev" ? Dev : Production) {}   // nested is fine
+```
+
+Every branch must be a configuration name, so the transpiler still knows the
+full set of candidates — it can inject the imports, keep the diagnostics
+working, and tell you (via `--explain`) which configurations a key could come
+from. Only the *choice* is dynamic; the shape stays static, and scope still
+follows position, so this works in a class body or a function too.
+
+Keys that **every** branch binds still count as guaranteed, so an
+`injectable` of that type needs no default initializer.
+
 #### Placing a configuration: anonymous `extends` (new in 2.1)
 
 Naming a configuration decides **what** the wiring is; *where you write it*
@@ -192,6 +211,17 @@ to the global scope wherever it runs, including inside functions and
 conditionals. Reach for `configuration extends` when you want declarative,
 lexical wiring (it also folds statically); reach for `activate` when you
 genuinely want to decide at runtime.
+
+> **Changing in 3.0.** `activate X;` will become sugar for
+> `configuration extends X {}`, so its scope will follow *where it is
+> written* like every other configuration. At the top level nothing changes.
+> Inside a function or a conditional it would change meaning, so 3.0 makes
+> those a build error that points at the replacement — write
+> `configuration extends X {}` for the block-scoped meaning, or select at
+> runtime with `configuration extends (cond ? X : Y) {}` if you wanted the
+> whole program rewired. 2.3 warns about those positions today; the
+> transpiler prints them, and `transpileDisonToTS` reports them through the
+> new `onWarning` option.
 
 #### Forward references (new in 1.5.0)
 
