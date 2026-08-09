@@ -53,7 +53,10 @@ Class-scope configuration (an anonymous `configuration { ... }` inside
 a class body) as a class's own declarative wiring, inherited by
 subclasses — and folded statically, because a class scope is lexical.
 Also shows the precision of the analysis: an unrelated class using the
-same type is not affected by another class's scope.
+same type is not affected by another class's scope, and a subclass that
+re-wires only part of what its parent wired gets its own generated getter
+while its siblings keep inheriting (new in 2.2 — run with `--explain` to
+see the diverging subclass listed under its parent).
 
 ```bash
 npx dison --explain sample/04-class-scope.dis

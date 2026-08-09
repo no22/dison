@@ -44,6 +44,9 @@ export interface WiringTable {
   dropRegistrations: boolean;
   // --explain 用の整形済みレポート（1 injectable 1行）。
   report: string[];
+  // サブクラス別ゲッター再宣言（docs/subclass-getter-redeclaration.md）。
+  // クラス本体の "{" トークン位置 → そこへ注入するメンバ宣言テキスト。
+  classMemberInjections: Map<number, string[]>;
 }
 
 // ---------------------------------------------------------------------
@@ -715,6 +718,44 @@ export function analyzeTopLevel(
   return { barriers, declMentions };
 }
 
+
+// 分岐したサブクラスへ注入するゲッターのテキスト（docs/subclass-getter-redeclaration.md §3）。
+// バッキングフィールドはクラス別の一意名にする（基底と同名の private を派生で再宣言
+// すると tsc が TS2415 にするため）。
+export function renderInjectedGetter(
+  node: Extract<Node, { kind: "injectable" }>,
+  recvClass: string,
+  d: WiringDecision,
+  fallbackExpr: string
+): string {
+  const p = node.propName;
+  const t = node.typeName;
+  const f = `_${p}_${recvClass}`;
+  if (d.kind === "static") {
+    return [
+      ``,
+      `  private ${f}?: ${t};`,
+      `  get ${p}(): ${t} {`,
+      `    if (!this.${f}) {`,
+      `      this.${f} = ${d.expr};`,
+      `    }`,
+      `    return this.${f}!;`,
+      `  }`,
+    ].join("\n");
+  }
+  return [
+    ``,
+    `  private readonly __dison_scope_${f} = __disonCurrentScope();`,
+    `  private ${f}?: ${t};`,
+    `  get ${p}(): ${t} {`,
+    `    if (!this.${f}) {`,
+    `      this.${f} = __disonResolveInjectable(this.__dison_scope_${f}, this.constructor, "${p}", () => ${fallbackExpr});`,
+    `    }`,
+    `    return this.${f}!;`,
+    `  }`,
+  ].join("\n");
+}
+
 // dison ノードの開始位置マップ（バリア検出でスキップに使う）。
 // token ノードは tokenPos を持たないが、トップレベル宣言で Symbol を作るだけ
 // なのでバリアにならない。findFirstBarrier は "token" キーワードを知らないため、
@@ -722,6 +763,10 @@ export function analyzeTopLevel(
 export function buildDisonStarts(tokens: Token[], ast: Node[]): Map<number, Node> {
   const disonStarts = new Map<number, Node>();
   for (const node of ast) {
+    // raw ノードも tokenPos を持つ（クラス本体への注入用）が、ここで登録するのは
+    // DSL 構文のノードだけ。raw を入れると全トークンが「読み飛ばす対象」になり
+    // バリア検出が機能しなくなる。
+    if (node.kind === "raw") continue;
     const pos = (node as { tokenPos?: number }).tokenPos;
     if (pos !== undefined) disonStarts.set(pos, node);
   }
@@ -1142,12 +1187,18 @@ export function computeWiringTable(
     return undefined;
   };
 
-  for (const { node, className } of injectables) {
-    const decide = (): WiringDecision => {
+  // 受け手クラス recv ごとに勝者を決める（docs/subclass-getter-redeclaration.md §2）。
+  // className は injectable が宣言されたクラス、recv は解決の受け手（= 自身または子孫）。
+  const decideFor = (
+    node: Extract<Node, { kind: "injectable" }>,
+    className: string | null,
+    recv: string
+  ): WiringDecision => {
+    {
       if (className === null) {
         return { kind: "dynamic", reason: "enclosing class is not a top-level class declaration" };
       }
-      const chain = chainNamesOf(className);
+      const chain = chainNamesOf(recv);
       if (chain.unknown) {
         return { kind: "dynamic", reason: "class heritage is not statically analyzable (mixin or expression in extends)" };
       }
@@ -1163,54 +1214,6 @@ export function computeWiringTable(
       }
       const rk = overrideTaint.get(relKey(className, node.propName));
       if (rk !== undefined) return { kind: "dynamic", reason: rk };
-
-      // サブクラス分岐: 子孫クラスを対象にしたプレバリア override が存在する
-      // → 単一のゲッターに畳めない（設計 §3.2。将来はサブクラス側で再宣言）。
-      for (const name of classes.keys()) {
-        if (name === className) continue;
-        const c = chainNamesOf(name);
-        if (!c.names.includes(className)) continue;
-        // name は className の子孫。overrideTaint は上で見たので、ここでは
-        // プレバリアの override イベントの分岐だけを見る。
-        const m = overrideMap.get(name);
-        if (m?.has(node.propName)) {
-          return {
-            kind: "dynamic",
-            reason: `subtree winners diverge (override ${name} targets a subclass)`,
-          };
-        }
-        for (const t of c.names) {
-          if (t === className) break; // className より手前（= より子側）だけを見る
-          if (overrideMap.get(t)?.has(node.propName)) {
-            return {
-              kind: "dynamic",
-              reason: `subtree winners diverge (override ${t} targets a subclass)`,
-            };
-          }
-        }
-        // L1.5: 子孫側のクラスフレームが同じプロパティ/キーを配線している場合も
-        // 勝者が分岐する（子孫インスタンスはそのフレームを先に見るため）。
-        for (const t of c.names) {
-          if (t === className) break;
-          for (const frame of classFramesByClass.get(t) ?? []) {
-            for (const e of frame) {
-              if (e.kind === "override") {
-                if (c.names.includes(e.className) && e.assignments.some((a) => a.prop === node.propName)) {
-                  return {
-                    kind: "dynamic",
-                    reason: `subtree winners diverge (class-scope override on subclass ${t})`,
-                  };
-                }
-              } else if (isSimpleTypeShape(node.typeKey) && bindKeyOf(e) === keyExprFor(node.typeKey, node.token, strategy)) {
-                return {
-                  kind: "dynamic",
-                  reason: `subtree winners diverge (class-scope bind on subclass ${t})`,
-                };
-              }
-            }
-          }
-        }
-      }
 
       // override 勝者: クラスフレーム層（scope-major: グローバルより優先。L1.5）
       const fw = frameOverrideWinner(chain.names, node.propName);
@@ -1279,52 +1282,145 @@ export function computeWiringTable(
         expr: node.defaultExpr !== undefined ? `(${node.defaultExpr})` : `new ${node.typeName}()`,
         why: node.defaultExpr !== undefined ? "no wiring (default initializer)" : "no wiring (auto-constructed)",
       };
-    };
-
-    const d = decide();
-    decisions.set(node, d);
-    if (d.kind === "static" && localScopesExist) {
-      const analyzed = analyzeWinnerExpr(d.expr);
-      if (analyzed === "opaque") {
-        decisions.set(node, {
-          kind: "dynamic",
-          reason: "winner expression is not analyzable under scoped configurations in this file",
-        });
-      } else {
-        depsOf.set(node, analyzed.deps);
-      }
     }
+  };
+
+  // --- 受け手クラスごとの判定（サブクラス別ゲッター再宣言。§2）---------------
+  // decisionAt: injectable ノード → 受け手クラス名 → 判定。
+  const decisionAt = new Map<Node, Map<string, WiringDecision>>();
+  const depsAt = new Map<string, string[]>();
+  const depsKey = (node: Node, recv: string): string => `${injectables.findIndex((i) => i.node === node)}|${recv}`;
+
+  // root を継承する全クラス（root 自身を含む）。
+  const subtreeOf = (root: string): string[] => {
+    const out = [root];
+    for (const name of classes.keys()) {
+      if (name === root) continue;
+      const c = chainNamesOf(name);
+      if (!c.unknown && c.names.includes(root)) out.push(name);
+    }
+    return out;
+  };
+
+  // super.<prop> がソース中に現れるか（§4.1 のガード）。現れる場合、その
+  // プロパティは再宣言してはならない（super が基底のゲッターを呼ぶようになり、
+  // 受け手の勝者を返す現行挙動と食い違う）。
+  const superProps = new Set<string>();
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (!(t.type === "ident" && t.text === "super")) continue;
+    const dot = nextSig(tokens, i + 1);
+    if (!(tokens[dot]?.type === "punct" && tokens[dot].text === ".")) continue;
+    const prop = nextSig(tokens, dot + 1);
+    if (tokens[prop]?.type === "ident") superProps.add(tokens[prop].text);
+  }
+
+  for (const { node, className } of injectables) {
+    const recvs = className === null ? ["<none>"] : subtreeOf(className);
+    const m = new Map<string, WiringDecision>();
+    for (const recv of recvs) {
+      let d = decideFor(node, className, recv);
+      if (d.kind === "static" && localScopesExist) {
+        const analyzed = analyzeWinnerExpr(d.expr);
+        if (analyzed === "opaque") {
+          d = {
+            kind: "dynamic",
+            reason: "winner expression is not analyzable under scoped configurations in this file",
+          };
+        } else {
+          depsAt.set(depsKey(node, recv), analyzed.deps);
+        }
+      }
+      m.set(recv, d);
+    }
+    decisionAt.set(node, m);
   }
 
   // 推移的 taint の不動点（strict regime のみ。設計 §3.2）:
-  // 勝者式が構築するクラス（とその継承鎖）の injectable がひとつでも dynamic なら、
+  // 勝者式が構築するクラス T の injectable（受け手 T で解決したもの）が dynamic なら、
   // このゲッターも dynamic に降格する（構築時スコープ捕捉の差が観測されうるため）。
   if (localScopesExist) {
     let changed = true;
     while (changed) {
       changed = false;
       for (const { node } of injectables) {
-        const d = decisions.get(node)!;
-        if (d.kind !== "static") continue;
-        const deps = depsOf.get(node) ?? [];
-        for (const dep of deps) {
-          if (!classes.has(dep)) continue; // 未宣言（import 等）は別モジュールの解決系
-          for (const cls of chainNamesOf(dep).names) {
-            const members = injectablesByClass.get(cls) ?? [];
-            for (const m of members) {
-              const md = decisions.get(m)!;
-              if (md.kind === "dynamic") {
-                decisions.set(node, {
-                  kind: "dynamic",
-                  reason: `depends on ${cls} whose injectable "${m.propName}" is dynamic`,
-                });
-                changed = true;
+        for (const [recv, d] of decisionAt.get(node)!) {
+          if (d.kind !== "static") continue;
+          for (const dep of depsAt.get(depsKey(node, recv)) ?? []) {
+            if (!classes.has(dep)) continue; // 未宣言（import 等）は別モジュールの解決系
+            let demoted: WiringDecision | undefined;
+            for (const cls of chainNamesOf(dep).names) {
+              for (const m of injectablesByClass.get(cls) ?? []) {
+                // 構築されるのは dep なので、受け手は dep として引く。
+                const md = decisionAt.get(m)?.get(dep) ?? decisionAt.get(m)?.get(cls);
+                if (md !== undefined && md.kind === "dynamic") {
+                  demoted = {
+                    kind: "dynamic",
+                    reason: `depends on ${dep} whose injectable "${m.propName}" is dynamic`,
+                  };
+                }
               }
             }
+            if (demoted !== undefined) {
+              decisionAt.get(node)!.set(recv, demoted);
+              changed = true;
+              break;
+            }
           }
-          if (decisions.get(node)!.kind === "dynamic") break;
         }
       }
+    }
+  }
+
+  // --- 宣言クラスの判定と、分岐するサブクラスへの再宣言 ---------------------
+  const sameDecision = (a: WiringDecision, b: WiringDecision): boolean =>
+    a.kind === "dynamic" ? b.kind === "dynamic" : b.kind === "static" && a.expr === b.expr;
+
+  // 動的形の fallback（codegen.generateInjectable と同じ規則）。
+  const fallbackExprOf = (node: Extract<Node, { kind: "injectable" }>): string => {
+    const finalDefault =
+      node.defaultExpr !== undefined ? `(${node.defaultExpr})` : `new ${node.typeName}()`;
+    return isSimpleTypeShape(node.typeKey)
+      ? `resolveType(${keyExprFor(node.typeKey, node.token, strategy)}, () => ${finalDefault})`
+      : finalDefault;
+  };
+
+  const classMemberInjections = new Map<number, string[]>();
+  // レポート用: 実際に注入した (宣言ノード → [受け手クラス, 判定]) の記録。
+  const injectedFor = new Map<Node, { recv: string; d: WiringDecision }[]>();
+  const addInjection = (cls: string, text: string): void => {
+    const info = classes.get(cls);
+    if (info === undefined) return;
+    const arr = classMemberInjections.get(info.bodyStart) ?? [];
+    arr.push(text);
+    classMemberInjections.set(info.bodyStart, arr);
+  };
+
+  for (const { node, className } of injectables) {
+    const byRecv = decisionAt.get(node)!;
+    if (className === null) {
+      decisions.set(node, byRecv.get("<none>")!);
+      continue;
+    }
+    const own = byRecv.get(className)!;
+    const diverging = [...byRecv].filter(
+      ([recv]) => recv !== className && !sameDecision(byRecv.get(recv)!, byRecv.get(classes.get(recv)?.baseName ?? className)!)
+    );
+    if (diverging.length > 0 && superProps.has(node.propName)) {
+      // §4.1: super.<prop> があると再宣言は挙動を変える。従来どおり単一ゲッターを
+      // 動的に落とす（受け手ごとの解決はランタイムが行う）。
+      decisions.set(node, {
+        kind: "dynamic",
+        reason: `subtree winners diverge, and "super.${node.propName}" is used (a re-declared getter would change what super returns)`,
+      });
+      continue;
+    }
+    decisions.set(node, own);
+    for (const [recv, d] of diverging) {
+      addInjection(recv, renderInjectedGetter(node, recv, d, fallbackExprOf(node)));
+      const arr = injectedFor.get(node) ?? [];
+      arr.push({ recv, d });
+      injectedFor.set(node, arr);
     }
   }
 
@@ -1338,13 +1434,15 @@ export function computeWiringTable(
   const needsRuntime = anyDynamic || localScopesExist || dynamicContextWiring || postBarrierWiring;
 
   const report: string[] = [];
+  const line = (site: string, d: WiringDecision): string =>
+    d.kind === "static"
+      ? `${site.padEnd(24)} → ${d.expr.padEnd(28)} [static: ${d.why}]`
+      : `${site.padEnd(24)} → ${"runtime lookup".padEnd(28)} [dynamic: ${d.reason}]`;
   for (const { node, className } of injectables) {
-    const d = decisions.get(node)!;
-    const site = `${className ?? "?"}.${node.propName}`;
-    if (d.kind === "static") {
-      report.push(`${site.padEnd(24)} → ${d.expr.padEnd(28)} [static: ${d.why}]`);
-    } else {
-      report.push(`${site.padEnd(24)} → ${"runtime lookup".padEnd(28)} [dynamic: ${d.reason}]`);
+    report.push(line(`${className ?? "?"}.${node.propName}`, decisions.get(node)!));
+    // 再宣言したサブクラスは親の下にぶら下げて表示する（§7）。
+    for (const { recv, d } of injectedFor.get(node) ?? []) {
+      report.push(line(`  └ ${recv}.${node.propName}`, d));
     }
   }
 
@@ -1353,5 +1451,6 @@ export function computeWiringTable(
     needsRuntime,
     dropRegistrations: !needsRuntime,
     report,
+    classMemberInjections,
   };
 }

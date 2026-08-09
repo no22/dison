@@ -38,7 +38,10 @@ export type ConfigEntry = OverrideEntry | BindEntry;
 // （配線文と実行文の前後関係）・囲みクラスの特定・blockContext参照に使う。
 // raw ノードには不要（静的解決はトークン列側を直接走査する）。
 export type Node =
-  | { kind: "raw"; text: string }
+  // tokenPos: raw も含め全ノードが元トークン列の索引を持つ。サブクラス別ゲッター
+  // 再宣言（docs/subclass-getter-redeclaration.md §5）が、クラス本体の "{" の位置に
+  // メンバを注入するために使う。
+  | { kind: "raw"; text: string; tokenPos?: number }
   // configuration: name が undefined なら無名（auto-active、宣言的。
   // docs/scoped-configuration.md）。scope は構文位置で決まるレベル:
   //   - "global": トップレベル。名前付きは activate 関数、無名は即時グローバル適用。

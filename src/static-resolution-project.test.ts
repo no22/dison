@@ -506,6 +506,69 @@ export const results = [new ReportService().render("42"), underTest()];
   });
 });
 
+describe("サブクラス別ゲッター再宣言（クロスファイル）", () => {
+  it("別ファイルのサブクラスにもゲッターを注入し、勝者式は factory hoisting される", () => {
+    const files = {
+      "base.dis": `
+export class M { tag() { return "m"; } }
+export class Base { injectable dep: M; }
+`,
+      "sub.dis": `
+import { M, Base } from "./base";
+export class M2 extends M { tag() { return "m2"; } }
+export class Sub extends Base {}
+`,
+      "main.dis": `
+import { Base } from "./base";
+import { Sub, M2 } from "./sub";
+const LABEL = "wired";
+configuration { override Sub { dep = new M2(); } }
+export const results = [new Base().dep.tag(), new Sub().dep.tag(), LABEL];
+`,
+    };
+    const { outputs, wiring } = transpileProject(files);
+    // Sub は sub.dis にあるので、そのファイルに注入される。
+    expect(outputs.get("sub.dis")!).toContain("_dep_Sub");
+    expect(outputs.get("base.dis")!).toContain("this._dep = new M();");
+    for (const [, w] of wiring) expect(w.needsRuntimeImport).toBe(false);
+    const folded = runProject(outputs, "main.ts");
+    expect(folded.results).toEqual(["m", "m2", "wired"]);
+    const dynamic = runProject(transpileProject(files, { noStatic: true }).outputs, "main.ts");
+    expect(dynamic.results).toEqual(["m", "m2", "wired"]);
+  });
+
+  it("差分継承（クラススコープ）がファイルを跨いでも畳める", () => {
+    const files = {
+      "base.dis": `
+export class Repo { tag() { return "real"; } }
+export class A extends Repo { tag() { return "a"; } }
+export class Base {
+  injectable repo: Repo;
+  configuration { bind Repo = A; }
+}
+`,
+      "sub.dis": `
+import { Repo, Base } from "./base";
+export class B extends Repo { tag() { return "b"; } }
+export class Sub extends Base {
+  configuration { bind Repo = B; }
+}
+`,
+      "main.dis": `
+import { Base } from "./base";
+import { Sub } from "./sub";
+export const results = [new Base().repo.tag(), new Sub().repo.tag()];
+`,
+    };
+    const { outputs } = transpileProject(files);
+    expect(outputs.get("sub.dis")!).toContain("_repo_Sub");
+    const folded = runProject(outputs, "main.ts");
+    expect(folded.results).toEqual(["a", "b"]);
+    const dynamic = runProject(transpileProject(files, { noStatic: true }).outputs, "main.ts");
+    expect(dynamic.results).toEqual(["a", "b"]);
+  });
+});
+
 describe("フェーズ2: 混在プロジェクト", () => {
   it("ローカルスコープを使うファイルはランタイム維持、畳めたファイルは import 無し", () => {
     const files = {

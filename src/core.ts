@@ -373,6 +373,7 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
       needsRuntime: pw.needsRuntimeImport,
       dropRegistrations: pw.dropRegistrations,
       report: pw.report,
+      classMemberInjections: new Map(pw.classMemberInjections ?? []),
     };
   }
 

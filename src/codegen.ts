@@ -433,9 +433,16 @@ export function generate(
   let scopeCounter = 0;
   for (const node of nodes) {
     switch (node.kind) {
-      case "raw":
+      case "raw": {
         out += node.text;
+        // サブクラス別ゲッター再宣言: クラス本体の "{" の直後にメンバを注入する
+        // （docs/subclass-getter-redeclaration.md §5）。
+        const injected = node.tokenPos !== undefined
+          ? wiring?.classMemberInjections.get(node.tokenPos)
+          : undefined;
+        if (injected !== undefined) out += injected.join("\n") + "\n";
         break;
+      }
       case "configuration":
         out += generateConfiguration(
           node,

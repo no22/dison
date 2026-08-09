@@ -47,6 +47,20 @@ class Analytics {
   }
 }
 
-console.log(new Reporting().describe());       // reporting on memory
-console.log(new WeeklyReporting().describe()); // reporting on memory
-console.log(new Analytics().describe());       // analytics on sql
+// Differential inheritance: a subclass re-wires only the part it wants to
+// change, inheriting the rest. Since 2.2 this folds too — the transpiler
+// computes a winner per class and re-declares the getter only where it
+// actually differs, so the prototype chain does the dispatch for free.
+// (Run with --explain: ArchivedReporting appears indented under Reporting.)
+class ArchivedStore extends Store {
+  kind = "archive";
+}
+
+class ArchivedReporting extends Reporting {
+  configuration { bind Store = ArchivedStore; }
+}
+
+console.log(new Reporting().describe());         // reporting on memory
+console.log(new WeeklyReporting().describe());   // reporting on memory (inherited)
+console.log(new ArchivedReporting().describe()); // reporting on archive (own wiring)
+console.log(new Analytics().describe());         // analytics on sql

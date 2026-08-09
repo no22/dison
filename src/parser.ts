@@ -84,7 +84,7 @@ export class Parser {
       const t = this.peek();
 
       if (this.isTrivia(t)) {
-        nodes.push({ kind: "raw", text: this.next().text });
+        nodes.push({ kind: "raw", text: this.next().text, tokenPos: this.pos - 1 });
         continue;
       }
 
@@ -164,7 +164,7 @@ export class Parser {
       }
 
       // DSLキーワードに該当しないトークンはすべて無傷でパススルー
-      nodes.push({ kind: "raw", text: this.next().text });
+      nodes.push({ kind: "raw", text: this.next().text, tokenPos: this.pos - 1 });
     }
     return nodes;
   }

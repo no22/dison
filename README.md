@@ -228,7 +228,9 @@ needed) for the place it's written:
   subclasses (which can override just the parts they change). If the
   same class body wires the same key twice, the last configuration
   wins (new in 1.6.0). Class scopes are lexical, so static resolution
-  folds them at transpile time (new in 2.0).
+  folds them at transpile time (new in 2.0) — including the differential
+  case where a subclass re-wires only part of what its parent wired
+  (new in 2.2).
 
 ```dison
 class UserService {
@@ -288,7 +290,9 @@ properties are inherited. The most specific registration wins: if both
 `override Service` and `override SubService` set the same property, a
 `SubService` instance uses the latter. Across scopes the usual priority
 (local > class > global) is checked first, so a local override targeting
-a base class beats a global override targeting the subclass.
+a base class beats a global override targeting the subclass. Since 2.2 this
+folds statically as well: each class in the hierarchy gets whichever getter
+its own winner requires.
 
 `override` can also be written standalone (not wrapped in a
 `configuration`), which desugars to an immediate assignment — useful
@@ -434,16 +438,24 @@ What folds:
   those statements cannot resolve the key (it traces the identifiers a
   statement mentions through declarations, imports, bind chains and
   override values);
-- class-scope configurations, including inheritance.
+- class-scope configurations, including inheritance;
+- wiring that differs per subclass (new in 2.2) — the analysis computes a
+  winner for each class in the hierarchy and re-declares the getter only on
+  the classes whose winner actually differs from their parent's, letting the
+  prototype chain do the dispatch at no runtime cost.
 
 What stays on the registry — with the reason, which you can inspect
 with **`dison --explain <file>`**:
 
 ```
 UserService.repo   → new MockUserRepository()   [static: bind IRepository (top-level wiring)]
+  └ AdminService.repo → new AdminRepository()   [static: override AdminService (top-level wiring)]
 Chained.value      → runtime lookup             [dynamic: activated after executable top-level code]
 Handler.db         → runtime lookup             [dynamic: bound in a local scope]
 ```
+
+Lines indented under another are subclasses whose wiring diverges from their
+parent's; they get their own generated getter.
 
 Dynamic wiring keeps its exact 1.x behavior: `activate` calls that run
 after a key was already used (or inside functions/conditionals), local

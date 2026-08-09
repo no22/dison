@@ -47,6 +47,7 @@ import {
 import {
   collectTopLevelClasses,
   enclosingTopLevelClass,
+  renderInjectedGetter,
   buildDisonStarts,
   analyzeWinnerExpr,
   analyzeTopLevel,
@@ -81,6 +82,9 @@ export interface ProjectFileWiring {
   factoryImports: { specifier: string; names: string[] }[];
   // --explain 用レポート（このファイルの injectable のみ）。
   report: string[];
+  // サブクラス別ゲッター再宣言（docs/subclass-getter-redeclaration.md）。
+  // このファイル内のクラス本体 "{" のトークン位置 → 注入するメンバ宣言。
+  classMemberInjections: [number, string[]][];
 }
 
 // ---------------------------------------------------------------------
@@ -926,10 +930,39 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   // injectable ごとの判定
   // ---------------------------------------------------------------
 
-  const decisions = new Map<string, WiringDecision>(); // `${norm}#${index}` → 判定
+  const decisions = new Map<string, WiringDecision>(); // `${norm}#${index}` → 宣言クラスでの判定
   const winnerHome = new Map<string, FileAnalysis>(); // static 判定の勝者式の所属ファイル
-  const winnerDeps = new Map<string, string[]>(); // strict regime 用（正準クラス ID）
   const decKey = (fa: FileAnalysis, index: number): string => `${fa.norm}#${index}`;
+  // 受け手クラスごとの判定（サブクラス別ゲッター再宣言）。
+  const recvDecisions = new Map<string, WiringDecision>();
+  const recvHome = new Map<string, FileAnalysis>();
+  const recvDeps = new Map<string, string[]>();
+  const recvKey = (fa: FileAnalysis, index: number, recv: string): string =>
+    `${fa.norm}#${index}@${recv}`;
+  // root（正準クラス ID）を継承する全クラス（root 自身を含む）。
+  const subtreeCanonOf = (root: string): string[] => {
+    const out = [root];
+    for (const { canonId } of allDeclaredCanon) {
+      if (canonId === root) continue;
+      const c = chainCanonOf(canonId);
+      if (!c.unknown && c.ids.includes(root)) out.push(canonId);
+    }
+    return out;
+  };
+  // super.<prop> の使用（§4.1 のガード）。プロジェクト全体で見る。
+  const superProps = new Set<string>();
+  for (const fa of analyses) {
+    for (let i = 0; i < fa.tokens.length; i++) {
+      const t = fa.tokens[i];
+      if (!(t.type === "ident" && t.text === "super")) continue;
+      let dot = i + 1;
+      while (dot < fa.tokens.length && (fa.tokens[dot].type === "whitespace" || fa.tokens[dot].type === "comment")) dot++;
+      if (!(fa.tokens[dot]?.type === "punct" && fa.tokens[dot].text === ".")) continue;
+      let prop = dot + 1;
+      while (prop < fa.tokens.length && (fa.tokens[prop].type === "whitespace" || fa.tokens[prop].type === "comment")) prop++;
+      if (fa.tokens[prop]?.type === "ident") superProps.add(fa.tokens[prop].text);
+    }
+  }
 
   // L1.5: フレーム列（実行時の消費順 = 正準チェイン順、同一クラス内は定義の逆順）。
   const frameSeq = (chainIds: string[]): { entries: ConfigEntry[]; fa: FileAnalysis }[] => {
@@ -975,11 +1008,11 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   for (const fa of analyses) {
     for (const inj of fa.injectables) {
       const { node, className } = inj;
-      const decide = (): { d: WiringDecision; home?: FileAnalysis } => {
+      const decideFor = (recvCanon: string): { d: WiringDecision; home?: FileAnalysis } => {
         if (className === null) {
           return { d: { kind: "dynamic", reason: "enclosing class is not a top-level class declaration" } };
         }
-        const selfCanon = `C::${fa.norm}::${className}`;
+        const selfCanon = recvCanon;
         const chain = chainCanonOf(selfCanon);
         if (chain.unknown) {
           return { d: { kind: "dynamic", reason: "class heritage is not statically analyzable (mixin or expression in extends)" } };
@@ -989,55 +1022,6 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
         for (const cls of chain.ids) {
           const t = overrideTaint.get(`${cls} ${node.propName}`);
           if (t !== undefined) return { d: { kind: "dynamic", reason: t } };
-        }
-        // サブクラス勝者分岐（プロジェクト全体の子孫を対象に見る）
-        for (const { canonId } of allDeclaredCanon) {
-          if (canonId === selfCanon) continue;
-          const c = chainCanonOf(canonId);
-          if (!c.ids.includes(selfCanon)) continue;
-          for (const t of c.ids) {
-            if (t === selfCanon) break;
-            if (overrideMap.get(t)?.has(node.propName)) {
-              return {
-                d: {
-                  kind: "dynamic",
-                  reason: `subtree winners diverge (an override targets subclass ${t.split("::").pop()})`,
-                },
-              };
-            }
-          }
-          // L1.5: 子孫側のクラスフレームが同じプロパティ/キーを配線している場合も分岐。
-          for (const t of c.ids) {
-            if (t === selfCanon) break;
-            for (const frame of classFramesByCanonClass.get(t) ?? []) {
-              for (const e of frame.entries) {
-                if (e.kind === "override") {
-                  if (
-                    c.ids.includes(canonClass(frame.fa, e.className)) &&
-                    e.assignments.some((a) => a.prop === node.propName)
-                  ) {
-                    return {
-                      d: {
-                        kind: "dynamic",
-                        reason: `subtree winners diverge (class-scope override on subclass ${t.split("::").pop()})`,
-                      },
-                    };
-                  }
-                } else if (
-                  isSimpleTypeShape(node.typeKey) &&
-                  canonKey(frame.fa, e.originalTypeKey, e.token, interfaceIndex) ===
-                    canonKey(fa, node.typeKey, node.token, interfaceIndex)
-                ) {
-                  return {
-                    d: {
-                      kind: "dynamic",
-                      reason: `subtree winners diverge (class-scope bind on subclass ${t.split("::").pop()})`,
-                    },
-                  };
-                }
-              }
-            }
-          }
         }
         // override 勝者: クラスフレーム層（scope-major: グローバルより優先。L1.5）
         const fw = frameOverrideWinner(chain.ids, node.propName);
@@ -1109,22 +1093,28 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
         };
       };
 
-      const { d, home } = decide();
-      const k = decKey(fa, inj.index);
-      decisions.set(k, d);
-      if (d.kind === "static" && home !== undefined) {
-        winnerHome.set(k, home);
-        if (localScopesExist) {
-          const analyzed = analyzeWinnerExpr(d.expr);
-          if (analyzed === "opaque") {
-            decisions.set(k, {
-              kind: "dynamic",
-              reason: "winner expression is not analyzable under scoped configurations in this project",
-            });
-          } else {
-            winnerDeps.set(k, analyzed.deps.map((dep) => canonClass(home, dep)));
+      // 受け手クラスごとに判定する（docs/subclass-getter-redeclaration.md §2）。
+      const recvs =
+        className === null ? ["<none>"] : subtreeCanonOf(`C::${fa.norm}::${className}`);
+      for (const recv of recvs) {
+        const { d: d0, home } = decideFor(recv);
+        const rk = recvKey(fa, inj.index, recv);
+        let d = d0;
+        if (d.kind === "static" && home !== undefined) {
+          recvHome.set(rk, home);
+          if (localScopesExist) {
+            const analyzed = analyzeWinnerExpr(d.expr);
+            if (analyzed === "opaque") {
+              d = {
+                kind: "dynamic",
+                reason: "winner expression is not analyzable under scoped configurations in this project",
+              };
+            } else {
+              recvDeps.set(rk, analyzed.deps.map((dep) => canonClass(home, dep)));
+            }
           }
         }
+        recvDecisions.set(rk, d);
       }
     }
   }
@@ -1136,10 +1126,13 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
       changed = false;
       for (const fa of analyses) {
         for (const inj of fa.injectables) {
-          const k = decKey(fa, inj.index);
-          const d = decisions.get(k)!;
+          const recvs =
+            inj.className === null ? ["<none>"] : subtreeCanonOf(`C::${fa.norm}::${inj.className}`);
+          for (const recv of recvs) {
+          const k = recvKey(fa, inj.index, recv);
+          const d = recvDecisions.get(k)!;
           if (d.kind !== "static") continue;
-          for (const depCanon of winnerDeps.get(k) ?? []) {
+          for (const depCanon of recvDeps.get(k) ?? []) {
             // AMB は同名のプロジェクトクラスすべてに合流させる。
             const candidates =
               depCanon.startsWith("AMB::")
@@ -1148,20 +1141,93 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
             for (const cand of candidates) {
               for (const cls of chainCanonOf(cand).ids) {
                 for (const m of injectablesByCanonClass.get(cls) ?? []) {
-                  const md = decisions.get(decKey(m.fa, m.index))!;
-                  if (md.kind === "dynamic") {
-                    decisions.set(k, {
+                  // 構築されるのは cand なので、受け手は cand として引く。
+                  const md =
+                    recvDecisions.get(recvKey(m.fa, m.index, cand)) ??
+                    recvDecisions.get(recvKey(m.fa, m.index, cls));
+                  if (md !== undefined && md.kind === "dynamic") {
+                    recvDecisions.set(k, {
                       kind: "dynamic",
-                      reason: `depends on ${cls.split("::").pop()} whose injectable "${m.prop}" is dynamic`,
+                      reason: `depends on ${cand.split("::").pop()} whose injectable "${m.prop}" is dynamic`,
                     });
                     changed = true;
                   }
                 }
               }
             }
-            if (decisions.get(k)!.kind === "dynamic") break;
+            if (recvDecisions.get(k)!.kind === "dynamic") break;
+          }
           }
         }
+      }
+    }
+  }
+
+  // --- 宣言クラスの判定と、分岐するサブクラスへの再宣言（§2）-----------------
+  const sameDecision = (a: WiringDecision, b: WiringDecision): boolean =>
+    a.kind === "dynamic" ? b.kind === "dynamic" : b.kind === "static" && a.expr === b.expr;
+
+  // 注入する (受け手クラスの正準ID, 注入テキスト生成に必要な情報) の一覧。
+  interface Injection {
+    ownerCanon: string;
+    ownerFa: FileAnalysis;
+    ownerName: string;
+    node: Extract<Node, { kind: "injectable" }>;
+    decision: WiringDecision;
+    home: FileAnalysis | undefined;
+    fallbackFa: FileAnalysis;
+  }
+  const injectionsList: Injection[] = [];
+
+  for (const fa of analyses) {
+    for (const inj of fa.injectables) {
+      const k = decKey(fa, inj.index);
+      if (inj.className === null) {
+        decisions.set(k, recvDecisions.get(recvKey(fa, inj.index, "<none>"))!);
+        continue;
+      }
+      const selfCanon = `C::${fa.norm}::${inj.className}`;
+      const own = recvDecisions.get(recvKey(fa, inj.index, selfCanon))!;
+      const diverging: { recv: string; d: WiringDecision }[] = [];
+      for (const recv of subtreeCanonOf(selfCanon)) {
+        if (recv === selfCanon) continue;
+        const d = recvDecisions.get(recvKey(fa, inj.index, recv))!;
+        const m = /^C::(.+)::([^:]+)$/.exec(recv);
+        const recvFa = m !== null ? byNorm.get(m[1]) : undefined;
+        const info = m !== null ? recvFa?.classes.get(m[2]) : undefined;
+        const baseCanon =
+          info?.baseName !== undefined && info.baseName !== null && recvFa !== undefined
+            ? canonClass(recvFa, info.baseName)
+            : selfCanon;
+        const bd = recvDecisions.get(recvKey(fa, inj.index, baseCanon)) ?? own;
+        if (sameDecision(d, bd)) continue;
+        diverging.push({ recv, d });
+      }
+      if (diverging.length > 0 && superProps.has(inj.node.propName)) {
+        decisions.set(k, {
+          kind: "dynamic",
+          reason: `subtree winners diverge, and "super.${inj.node.propName}" is used (a re-declared getter would change what super returns)`,
+        });
+        continue;
+      }
+      decisions.set(k, own);
+      if (own.kind === "static") {
+        const h = recvHome.get(recvKey(fa, inj.index, selfCanon));
+        if (h !== undefined) winnerHome.set(k, h);
+      }
+      for (const { recv, d } of diverging) {
+        const m = /^C::(.+)::([^:]+)$/.exec(recv);
+        const ownerFa = m !== null ? byNorm.get(m[1]) : undefined;
+        if (m === null || ownerFa === undefined) continue; // 注入できない（§4.2）
+        injectionsList.push({
+          ownerCanon: recv,
+          ownerFa,
+          ownerName: m[2],
+          node: inj.node,
+          decision: d,
+          home: recvHome.get(recvKey(fa, inj.index, recv)),
+          fallbackFa: fa,
+        });
       }
     }
   }
@@ -1198,12 +1264,43 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   const factoryImportsByNorm = new Map<string, Map<string, Set<string>>>(); // norm → specifier → names
   let factoryCounter = 0;
 
+  // 宣言クラスのゲッターと、注入するサブクラスのゲッターを同じ規則で処理する。
+  interface HostedSite {
+    hostFa: FileAnalysis;          // ゲッターが置かれるファイル
+    get(): WiringDecision;
+    set(d: WiringDecision): void;
+    home: FileAnalysis | undefined;
+    label: string;
+  }
+  const hostedSites: HostedSite[] = [];
   for (const fa of analyses) {
     for (const inj of fa.injectables) {
       const k = decKey(fa, inj.index);
-      const d = decisions.get(k)!;
+      hostedSites.push({
+        hostFa: fa,
+        get: () => decisions.get(k)!,
+        set: (d) => decisions.set(k, d),
+        home: winnerHome.get(k),
+        label: `${inj.className ?? "?"}.${inj.node.propName}`,
+      });
+    }
+  }
+  for (const injection of injectionsList) {
+    hostedSites.push({
+      hostFa: injection.ownerFa,
+      get: () => injection.decision,
+      set: (d) => { injection.decision = d; },
+      home: injection.home,
+      label: `${injection.ownerName}.${injection.node.propName}`,
+    });
+  }
+
+  for (const site of hostedSites) {
+    {
+      const fa = site.hostFa;
+      const d = site.get();
       if (d.kind !== "static") continue;
-      const home = winnerHome.get(k);
+      const home = site.home;
       if (home === undefined || home.norm === fa.norm) continue; // 自ファイル → インライン
       // 評価順ガード: home が元々先に評価を終えている（import 追加は無効化される）、
       // または home が fa を支配している（fa の評価は常に home の評価の内側 →
@@ -1213,7 +1310,7 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
       const safe =
         (homeIdx !== undefined && faIdx !== undefined && homeIdx < faIdx) || dominates(home.norm, fa.norm);
       if (!safe) {
-        decisions.set(k, {
+        site.set({
           kind: "dynamic",
           reason: `winner expression lives in ${home.file.path}, which cannot be imported without changing module evaluation order`,
         });
@@ -1243,7 +1340,7 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
         bySpec.set(spec, names);
       }
       names.add(name);
-      decisions.set(k, { kind: "static", expr: `${name}()`, why: `${d.why}; hoisted from ${home.file.path}` });
+      site.set({ kind: "static", expr: `${name}()`, why: `${d.why}; hoisted from ${home.file.path}` });
     }
   }
 
@@ -1253,8 +1350,22 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
 
   let anyDynamic = false;
   for (const d of decisions.values()) if (d.kind === "dynamic") anyDynamic = true;
+  for (const injection of injectionsList) if (injection.decision.kind === "dynamic") anyDynamic = true;
   const needsRuntimeProject = anyDynamic || localScopesExist || dynamicContextWiring || postBarrierWiring;
   const dropRegistrations = !needsRuntimeProject;
+
+  // 動的形の fallback が使う照合キー式。宣言元ファイルの戦略で組み立てる
+  // （injectable の型注釈がそのファイルでどうキー化されるかに従う）。
+  const canonKeyExpr = (fa: FileAnalysis, node: Extract<Node, { kind: "injectable" }>): string => {
+    if (node.token !== undefined) return node.token;
+    const base = baseIdentifierOf(node.typeKey);
+    if (base !== node.typeKey) return JSON.stringify(node.typeKey);
+    if (fa.localDeclaredClasses.has(base) || fa.classes.has(base)) return base;
+    const imp = fa.importsByLocalName.get(base);
+    if (imp !== undefined && !imp.typeOnly && imp.specifier.startsWith(".")) return base;
+    if (fa.localTrueInterfaces.has(base) || fa.importsByLocalName.has(base)) return `__dison_token_${base}`;
+    return JSON.stringify(node.typeKey);
+  };
 
   const result = new Map<string, ProjectFileWiring>();
   for (const fa of analyses) {
@@ -1270,13 +1381,36 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
           n.kind === "standalone-bind" ||
           n.kind === "standalone-override"
       );
-    const report = fa.injectables.map((inj) => {
-      const d = decisions.get(decKey(fa, inj.index))!;
-      const site = `${inj.className ?? "?"}.${inj.node.propName}`;
-      return d.kind === "static"
+    const line = (site: string, d: WiringDecision): string =>
+      d.kind === "static"
         ? `${site.padEnd(24)} → ${d.expr.padEnd(28)} [static: ${d.why}]`
         : `${site.padEnd(24)} → ${"runtime lookup".padEnd(28)} [dynamic: ${d.reason}]`;
-    });
+    const report: string[] = [];
+    for (const inj of fa.injectables) {
+      report.push(line(`${inj.className ?? "?"}.${inj.node.propName}`, decisions.get(decKey(fa, inj.index))!));
+      // 再宣言したサブクラスは親の下にぶら下げて表示する（§7）。
+      for (const x of injectionsList) {
+        if (x.node !== inj.node) continue;
+        report.push(line(`  └ ${x.ownerName}.${x.node.propName}`, x.decision));
+      }
+      void 0;
+    }
+
+    // このファイルに注入するメンバ（クラス本体 "{" のトークン位置ごと）。
+    const injMap = new Map<number, string[]>();
+    for (const x of injectionsList) {
+      if (x.ownerFa.norm !== fa.norm) continue;
+      const info = fa.classes.get(x.ownerName);
+      if (info === undefined) continue;
+      const finalDefault =
+        x.node.defaultExpr !== undefined ? `(${x.node.defaultExpr})` : `new ${x.node.typeName}()`;
+      const fallback = isSimpleTypeShape(x.node.typeKey)
+        ? `resolveType(${canonKeyExpr(x.fallbackFa, x.node)}, () => ${finalDefault})`
+        : finalDefault;
+      const arr = injMap.get(info.bodyStart) ?? [];
+      arr.push(renderInjectedGetter(x.node, x.ownerName, x.decision, fallback));
+      injMap.set(info.bodyStart, arr);
+    }
     result.set(fa.file.path, {
       decisionsByInjectableIndex,
       dropRegistrations,
@@ -1286,6 +1420,7 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
         ([specifier, names]) => ({ specifier, names: [...names].sort() })
       ),
       report,
+      classMemberInjections: [...injMap],
     });
   }
   return result;

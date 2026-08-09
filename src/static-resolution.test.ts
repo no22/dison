@@ -193,7 +193,8 @@ function enable() { activate Cfg; }
     expect(out).toContain("bindTypeLazy");
   });
 
-  it("サブクラスを対象にしたoverrideがあると親のゲッターは畳まれない（勝者分岐）", () => {
+  it("サブクラスを対象にしたoverrideは、そのサブクラスにゲッターを再宣言して畳む", () => {
+    // 旧仕様では親ごと動的に落としていた（docs/subclass-getter-redeclaration.md）。
     const out = transpileDisonToTS(`
 configuration { override Sub { dep = new M2(); } }
 class M1 {}
@@ -201,7 +202,9 @@ class M2 extends M1 {}
 class Base { injectable dep: M1; }
 class Sub extends Base {}
 `);
-    expect(out).toContain("__disonResolveInjectable");
+    expect(out).toContain("this._dep = new M1();"); // Base は既定
+    expect(out).toContain("this._dep_Sub = (new M2());"); // Sub に再宣言
+    expect(out).not.toContain("__disonResolveInjectable");
   });
 
   it("mixin継承（extendsが式）のクラスのinjectableは畳まれない", () => {
@@ -315,7 +318,9 @@ export const results = [new Base().repo.tag, new Sub().repo.tag];
     expect(dynamic.results).toEqual(["cached", "cached"]);
   });
 
-  it("サブクラス側のフレームが同じキーを配線すると勝者分岐で畳まれない（差分継承）", () => {
+  it("差分継承（サブクラスのクラススコープ）もサブクラス側の再宣言で畳む", () => {
+    // scoped-configuration.md §3.2 が推奨する差分継承の形。旧仕様では動的に
+    // 落ちていたが、サブクラス別ゲッター再宣言で両方畳めるようになった。
     const program = `
 class Repo { tag = "real"; }
 class A extends Repo { tag = "a"; }
@@ -330,7 +335,10 @@ class Sub extends Base {
 export const results = [new Base().repo.tag, new Sub().repo.tag];
 `;
     const out = transpileDisonToTS(program);
-    expect(out).toContain("__disonResolveInjectable"); // Base.repo は動的維持
+    expect(out).toContain("this._repo = new A();");
+    expect(out).toContain("this._repo_Sub = new B();");
+    expect(out).not.toContain("__disonResolveInjectable");
+    expect(out).not.toContain("DI_REGISTRY"); // 全畳み → prelude 消去
     const folded = runGenerated(program);
     const dynamic = runGenerated(program, { staticResolution: false });
     expect(folded.results).toEqual(["a", "b"]);
@@ -411,6 +419,125 @@ class S { injectable repo: IRepo = makeRepo(); }
     // v1 ではクラススコープの存在が strict regime を発動し、makeRepo() が opaque で
     // 動的に落ちていた。L1.5 ではクラススコープは捕捉差を生まないので畳める。
     expect(out).toContain("this._repo = (makeRepo());");
+  });
+});
+
+describe("サブクラス別ゲッター再宣言", () => {
+  it("分岐していないサブクラスには再宣言しない（継承で足りる）", () => {
+    const out = transpileDisonToTS(`
+configuration { override Base { dep = new M2(); } }
+class M1 {}
+class M2 extends M1 {}
+class Base { injectable dep: M1; }
+class Sub extends Base {}
+class SubSub extends Sub {}
+`);
+    expect(out).toContain("this._dep = (new M2());");
+    expect(out).not.toContain("_dep_Sub");
+    expect(out).not.toContain("_dep_SubSub");
+  });
+
+  it("深い階層では分岐した中間クラスにだけ再宣言する", () => {
+    const program = `
+class M { tag = "m"; }
+class A extends M { tag = "a"; }
+class Base { injectable dep: M; }
+class Mid extends Base {}
+class Leaf extends Mid {}
+configuration { override Mid { dep = new A(); } }
+export const results = [new Base().dep.tag, new Mid().dep.tag, new Leaf().dep.tag];
+`;
+    const out = transpileDisonToTS(program);
+    expect(out).toContain("_dep_Mid");
+    expect(out).not.toContain("_dep_Leaf"); // Leaf は Mid と同じ勝者 → 継承
+    const folded = runGenerated(program);
+    const dynamic = runGenerated(program, { staticResolution: false });
+    expect(folded.results).toEqual(["m", "a", "a"]);
+    expect(dynamic.results).toEqual(["m", "a", "a"]);
+  });
+
+  it("再宣言したゲッターも遅延性とキャッシュを保つ", () => {
+    const mod = runGenerated(`
+export const log: string[] = [];
+class M { constructor() { log.push("M"); } }
+class M2 extends M { constructor() { super(); log.push("M2"); } }
+class Base { injectable dep: M; }
+class Sub extends Base {}
+configuration { override Sub { dep = new M2(); } }
+export const s = new Sub();
+export function touch() { return [s.dep, s.dep]; }
+`);
+    expect(mod.log).toEqual([]); // 構築時には評価されない
+    const [a, b] = mod.touch();
+    expect(a).toBe(b); // インスタンス単位でキャッシュされる
+    expect(mod.log).toEqual(["M", "M2"]); // 1回だけ構築
+  });
+
+  it("サブツリーの一部だけ動的でもよい（親は静的のまま）", () => {
+    const program = `
+class Repo { tag = "real"; }
+class Mock extends Repo { tag = "mock"; }
+class Base { injectable repo: Repo; }
+class Sub extends Base {}
+export function underTest(): string {
+  configuration { override Sub { repo = new Mock(); } }
+  return new Sub().repo.tag;
+}
+export const results = [new Base().repo.tag, new Sub().repo.tag];
+`;
+    const report = explainWiring(program);
+    // Base は既定に畳まれ、Sub だけが動的（関数内 override なので）。
+    expect(report.find((l) => l.startsWith("Base.repo"))).toContain("[dynamic:");
+    const folded = runGenerated(program);
+    const dynamic = runGenerated(program, { staticResolution: false });
+    expect(folded.results).toEqual(dynamic.results);
+  });
+
+  it("super.<prop> が使われている場合は再宣言せず動的に落とす（挙動保存）", () => {
+    const program = `
+class M { tag = "m1"; }
+class M2 extends M { tag = "m2"; }
+class Base { injectable dep: M; }
+class Sub extends Base { probe(): string { return super.dep.tag; } }
+configuration { override Sub { dep = new M2(); } }
+export const results = [new Sub().dep.tag, new Sub().probe()];
+`;
+    const out = transpileDisonToTS(program);
+    expect(out).toContain("__disonResolveInjectable");
+    expect(out).not.toContain("_dep_Sub");
+    const report = explainWiring(program);
+    expect(report[0]).toContain("super.dep");
+    // 単一ゲッターのままなので super も受け手の勝者を返す（従来どおり）。
+    const folded = runGenerated(program);
+    const dynamic = runGenerated(program, { staticResolution: false });
+    expect(folded.results).toEqual(["m2", "m2"]);
+    expect(dynamic.results).toEqual(["m2", "m2"]);
+  });
+
+  it("--explain は分岐したサブクラスを親の下にぶら下げて表示する", () => {
+    const report = explainWiring(`
+class M1 {}
+class M2 extends M1 {}
+class Base { injectable dep: M1; }
+class Sub extends Base {}
+configuration { override Sub { dep = new M2(); } }
+`);
+    expect(report[0]).toMatch(/^Base\.dep/);
+    expect(report[1]).toMatch(/^ {2}└ Sub\.dep/);
+    expect(report[1]).toContain("(new M2())");
+  });
+
+  it("再宣言を含む出力が tsc --strict を通る形になっている（private 名の衝突回避）", () => {
+    const out = transpileDisonToTS(`
+class M1 {}
+class M2 extends M1 {}
+class Base { injectable dep: M1; }
+class Sub extends Base {}
+configuration { override Sub { dep = new M2(); } }
+`);
+    // 基底と同名の private を派生で再宣言すると TS2415 になるため、別名にする。
+    expect(out).toContain("private _dep?: M1;");
+    expect(out).toContain("private _dep_Sub?: M1;");
   });
 });
 
