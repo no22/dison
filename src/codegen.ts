@@ -128,11 +128,19 @@ function generateBindEntryLines(entry: BindEntry, strategy: KeyStrategy, local: 
 //   - global 無名: auto-active。即時にグローバルへ適用する呼び出しをその場に出す。
 // scopeId は複数の local/class configがあっても衝突しない連番（class は static フィールド名の
 // 一意性に、local は using 変数名の一意性に使う）。
+// configuration の applier 関数名（フレーム形のエントリを適用する関数）。
+// 宣言元ファイルで export し、ローカル/クラススコープへの展開側が直接呼ぶ
+// （docs/configuration-inheritance.md §3.2）。
+export function configApplierName(configName: string): string {
+  return `__dison_config_${configName}`;
+}
+
 function generateConfiguration(
   node: Extract<Node, { kind: "configuration" }>,
   strategy: KeyStrategy,
   scopeId: number,
-  wiring: WiringTable | undefined
+  wiring: WiringTable | undefined,
+  applierEmit: Set<string>
 ): string {
   // 静的解決で「登録を読む者がいない」と証明された場合、グローバル configuration の
   // 登録文は出力しない（ランタイム前置きごと消えるため、残すとコンパイルも通らない）。
@@ -140,7 +148,16 @@ function generateConfiguration(
   // なので、この分岐はグローバル形（名前付き/無名）にしか到達しない。
   if (wiring?.dropRegistrations === true && (node.scope === "global" || node.scope === "class")) {
     if (node.scope === "global" && node.name !== undefined) {
-      // activate 呼び出し側の形（activateName()）は変えないため、空の関数を残す。
+      // 呼び出し側の形（activateName() / applier 呼び出し）は変えないため、空の関数を残す。
+      if (applierEmit.has(node.name)) {
+        return (
+          `export function ${configApplierName(node.name)}(\n` +
+          `  __disonBind: (key: () => any, factory: () => any) => void,\n` +
+          `  __disonOverride: (cls: () => Function, prop: string, factory: () => any) => void\n` +
+          `): void {\n}\n` +
+          `export function activate${node.name}() {\n}`
+        );
+      }
       return `export function activate${node.name}() {\n}`;
     }
     // 無名グローバル / クラススコープ: 配線は畳んだゲッターに焼き込まれており、
@@ -148,8 +165,21 @@ function generateConfiguration(
     return "";
   }
   // local と class は「フレームへ差分を積む」形（__disonBind/__disonOverride）を共有する。
-  const frameForm = node.scope === "local" || node.scope === "class";
+  // 名前付きグローバルでも applier を emit する場合はフレーム形になる。
+  const emitApplier = node.name !== undefined && applierEmit.has(node.name);
+  const frameForm = node.scope === "local" || node.scope === "class" || emitApplier;
   const lines: string[] = [];
+  // extends 節の展開（docs/configuration-inheritance.md §3）:
+  //   - フレーム形（ローカル/クラス、および applier 本体）→ 親の applier を同じ
+  //     コールバックで呼ぶ。親のエントリ式は親のファイルで評価される。
+  //   - グローバル形 → 親の activate 関数を呼ぶ（既存機構。後勝ちで子が勝つ）。
+  for (const parent of node.extendsNames ?? []) {
+    lines.push(
+      frameForm
+        ? `  ${configApplierName(parent)}(__disonBind, __disonOverride);`
+        : `  activate${parent}();`
+    );
+  }
   for (const entry of node.entries) {
     if (entry.kind === "override") {
       lines.push(...generateOverrideEntryLines(entry, frameForm));
@@ -181,6 +211,19 @@ function generateConfiguration(
   if (node.name !== undefined) {
     // 名前付きグローバル。export しておくと他ファイルから import して activate できる
     // （docs/multi-file-support.md フェーズ1）。単一ファイルでもexportは無害。
+    if (emitApplier) {
+      // ローカル/クラススコープへ展開される configuration は、フレームのコールバックを
+      // 受け取る applier として emit し、activate はそれをグローバルへ流すラッパにする。
+      // 型は実行時型（__DisonKey 等）に依存しない構造的な形にしておく（共有ランタイム
+      // モジュールはそれらの型を export していないため）。
+      return (
+        `export function ${configApplierName(node.name)}(\n` +
+        `  __disonBind: (key: () => any, factory: () => any) => void,\n` +
+        `  __disonOverride: (cls: () => Function, prop: string, factory: () => any) => void\n` +
+        `): void {\n${lines.join("\n")}\n}\n` +
+        `export function activate${node.name}() { __disonApplyToGlobal(${configApplierName(node.name)}); }`
+      );
+    }
     return `export function activate${node.name}() {\n${lines.join("\n")}\n}`;
   }
   // 無名グローバル: auto-active。その場に即時適用する呼び出しを出す。
@@ -190,7 +233,8 @@ function generateConfiguration(
 function generateInjectable(
   node: Extract<Node, { kind: "injectable" }>,
   strategy: KeyStrategy,
-  wiring: WiringTable | undefined
+  wiring: WiringTable | undefined,
+  nonNewable: boolean
 ): string {
   const { propName: p, typeName: t, typeKey: k, defaultExpr, token } = node;
 
@@ -219,7 +263,17 @@ function generateInjectable(
   // defaultExpr が必須」であることを既に強制しているため、ここでは
   // defaultExpr が無ければ安全な型（new T() で問題なく生成できる）と
   // 分かっている。危険な型の判定・強制ロジックをここで再度持たない。
-  const finalDefault = defaultExpr !== undefined ? `(${defaultExpr})` : `new ${t}()`;
+  // 既定初期化式が無く `new` もできない型は、束縛が必ず存在することを検査済み
+  // （docs/injectable-default-relaxation.md §1.2）。到達しない防御的な throw を置く。
+  // 返り値型は never なので型引数 T と互換（tsc を通る）。
+  const finalDefault =
+    defaultExpr !== undefined
+      ? `(${defaultExpr})`
+      : nonNewable
+      ? `((): ${t} => { throw new Error(${JSON.stringify(
+          `Dison: no binding was found for injectable "${p}" (type ${t}).`
+        )}); })()`
+      : `new ${t}()`;
 
   // bind (TYPE_BINDINGS) は型注釈が識別子（＋ジェネリクス）の形をしていれば
   // 試みる。interfaceや型エイリアスも文字列キーとして扱えるため、これ自体は
@@ -368,7 +422,11 @@ export function generate(
   nodes: Node[],
   fromBindings: Map<string, FromActivateBinding>,
   strategy: KeyStrategy,
-  wiring?: WiringTable
+  wiring?: WiringTable,
+  applierEmit: Set<string> = new Set(),
+  // 既定初期化式が省略された injectable のうち `new` できない型かの判定
+  // （docs/injectable-default-relaxation.md §3.2）。
+  isNonNewable: (node: Extract<Node, { kind: "injectable" }>) => boolean = () => false
 ): string {
   let out = "";
   // local/class 無名 configuration の連番（using 変数名 / static フィールド名の衝突回避）。
@@ -383,11 +441,12 @@ export function generate(
           node,
           strategy,
           node.scope === "local" || node.scope === "class" ? scopeCounter++ : -1,
-          wiring
+          wiring,
+          applierEmit
         );
         break;
       case "injectable":
-        out += generateInjectable(node, strategy, wiring);
+        out += generateInjectable(node, strategy, wiring, isNonNewable(node));
         break;
       case "token":
         // 複数箇所（複数ファイルにまたがる場合も含む）から安定して参照

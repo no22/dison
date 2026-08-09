@@ -28,6 +28,7 @@ import { Lexer } from "./lexer.js";
 import type { Node, OverrideEntry, BindEntry, ConfigEntry } from "./ast.js";
 import { keyExprFor, type KeyStrategy } from "./codegen.js";
 import { isSimpleTypeShape, baseIdentifierOf, collectImportBindings, type ImportBinding } from "./analysis.js";
+import { flattenConfiguration } from "./config-inheritance.js";
 
 export type WiringDecision =
   | { kind: "static"; expr: string; why: string }
@@ -793,6 +794,15 @@ export function computeWiringTable(
     arr.push(node);
   }
 
+  // configuration の継承（docs/configuration-inheritance.md）: 解析は平坦化済みの
+  // 実効エントリ列に対して行う。単一ファイルなので親はローカル宣言のみ解決できる
+  // （解決できない親は無視 = そのエントリは見えない → 保守的に畳まない方向に働く）。
+  const flattenLocal = (n: Extract<Node, { kind: "configuration" }>): ConfigEntry[] =>
+    flattenConfiguration<undefined>(n, undefined, (name) => {
+      const decl = namedConfigs.get(name);
+      return decl !== undefined ? { node: decl, file: undefined } : undefined;
+    }).entries.map((fe) => fe.entry);
+
   // 収集結果
   const events: WiringEvent[] = [];
   const keyTaint: TaintMap = new Map();
@@ -879,7 +889,9 @@ export function computeWiringTable(
   for (const node of ast) {
     const entries: ConfigEntry[] =
       node.kind === "configuration"
-        ? node.entries
+        ? node.extendsNames === undefined
+          ? node.entries
+          : flattenLocal(node)
         : node.kind === "standalone-bind" || node.kind === "standalone-override"
         ? [node.entry]
         : [];
@@ -1012,9 +1024,10 @@ export function computeWiringTable(
   for (const node of ast) {
     const pos = (node as { tokenPos?: number }).tokenPos ?? 0;
     if (node.kind === "configuration") {
+      const effective = node.extendsNames === undefined ? node.entries : flattenLocal(node);
       if (node.scope === "local") {
         localScopesExist = true;
-        taintEntries(node.entries, "bound in a local scope");
+        taintEntries(effective, "bound in a local scope");
       } else if (node.scope === "class") {
         // L1.5: 囲みクラスが特定できればフレームとして勝者計算に参加させる。
         // 特定できない（関数内のネストクラス等）場合は従来どおり保守的に taint。
@@ -1025,10 +1038,10 @@ export function computeWiringTable(
             arr = [];
             classFramesByClass.set(encl, arr);
           }
-          arr.push(node.entries);
+          arr.push(effective);
           // 対象クラスが未宣言/継承鎖不明の override エントリは、未知のサブクラス
           // 関係を静的に否定できないため従来どおりブランケット taint に落とす。
-          for (const e of node.entries) {
+          for (const e of effective) {
             if (e.kind !== "override") continue;
             const t = classes.get(e.className);
             if (t === undefined || t.opaqueHeritage) {
@@ -1036,22 +1049,23 @@ export function computeWiringTable(
             }
           }
         } else {
-          taintEntries(node.entries, "bound in a class scope of a non-top-level class");
+          taintEntries(effective, "bound in a class scope of a non-top-level class");
         }
       } else if (node.name === undefined) {
         // 無名グローバル: その位置で登録される。先行バリアが使いうるキーだけ動的に落とす。
-        emitEntries(node.entries, pos, "");
+        emitEntries(effective, pos, "");
       }
       // 名前付きグローバルの定義自体はイベントではない（activate が担う）。
     } else if (node.kind === "activate") {
       if (node.fromPath !== undefined) continue; // 単一ファイルでは外部レジストリ行き（効果なし）
       const cfg = namedConfigs.get(node.name);
       if (cfg === undefined) continue; // import された configuration → 外部レジストリ行き
+      const cfgEntries = flattenLocal(cfg);
       if (!isTopLevel(pos)) {
         dynamicContextWiring = true;
-        taintEntries(cfg.entries, "activated inside a function or conditional");
+        taintEntries(cfgEntries, "activated inside a function or conditional");
       } else {
-        emitEntries(cfg.entries, pos, " (before this activate)");
+        emitEntries(cfgEntries, pos, " (before this activate)");
       }
     } else if (node.kind === "standalone-override" || node.kind === "standalone-bind") {
       const entry = node.kind === "standalone-override" ? node.entry : node.entry;

@@ -1,0 +1,15 @@
+// The consumer. It declares what it needs and nothing else — no default
+// initializer naming an implementation (new in 2.1: one is no longer
+// required when the wiring guarantees a binding), no import of any concrete
+// class, no knowledge of the configuration that will supply them.
+
+import type { Repository, Clock } from "./contracts";
+
+export class ReportService {
+  injectable repo: Repository;
+  injectable clock: Clock;
+
+  render(id: string): string {
+    return `[${this.clock.now()}] ${this.repo.find(id)}`;
+  }
+}

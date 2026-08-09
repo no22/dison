@@ -62,8 +62,10 @@ import {
   buildProjectClassIndex,
   buildProjectInterfaceIndex,
   computeCompanionPlanByFile,
+  computeConfigExtendsPlanByFile,
 } from "./collisions.js";
 import { collectDiUsedTypeNames } from "./codegen.js";
+import { flattenConfiguration, namedGlobalConfigurations, type ConfigurationNode } from "./config-inheritance.js";
 
 export interface ProjectFileWiring {
   // このファイルの injectable ノード（AST 出現順）に対応する判定。
@@ -252,6 +254,9 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   // ため、評価順の計算に含める（生成ファイルでは注入 import がユーザーの import より
   // 前に置かれる）。companion の対象はこのプランと同じ規則で決まる。
   const companionPlanByFile = computeCompanionPlanByFile(files);
+  // `configuration ... extends X` がファイルを跨ぐ場合、生成側は activateX /
+  // __dison_config_X の import を注入する。これも実際の評価順に影響するため含める。
+  const configExtendsPlanByFile = computeConfigExtendsPlanByFile(files);
 
   const analyses: FileAnalysis[] = files.map((file) => {
     const tokens = new Lexer(file.source).tokenize();
@@ -340,7 +345,11 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
             refs.push(toRef(n.fromPath));
           }
         }
-        // 3. ユーザーソース上の import/export-from
+        // 3. extends の import（同じく注入される）
+        for (const [, info] of configExtendsPlanByFile.get(file.path)?.extendsImports ?? []) {
+          refs.push(toRef(info.specifier));
+        }
+        // 4. ユーザーソース上の import/export-from
         refs.push(...collectModuleRefs(tokens, projectNorms, dir));
         return refs;
       })(),
@@ -455,6 +464,36 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
       arr.push({ fa, index: inj.index, prop: inj.node.propName, node: inj.node });
     }
   }
+
+  // configuration の継承（docs/configuration-inheritance.md）: 名前はプロジェクト全体で
+  // 解決する（宣言元ファイルを伴うので、平坦化されたエントリはそれぞれ正しい home を持つ
+  // → factory hoisting と評価順ガードがそのまま効く）。同名が複数ファイルにある場合は
+  // 参照元ファイル内の宣言を優先する。
+  const configDeclsByName = new Map<string, { node: ConfigurationNode; fa: FileAnalysis }[]>();
+  for (const fa of analyses) {
+    for (const [name, node] of namedGlobalConfigurations(fa.ast)) {
+      let arr = configDeclsByName.get(name);
+      if (arr === undefined) {
+        arr = [];
+        configDeclsByName.set(name, arr);
+      }
+      arr.push({ node, fa });
+    }
+  }
+  const resolveConfig = (name: string, from: FileAnalysis) => {
+    const cands = configDeclsByName.get(name);
+    if (cands === undefined || cands.length === 0) return undefined;
+    const own = cands.find((c) => c.fa.norm === from.norm) ?? cands[0];
+    return { node: own.node, file: own.fa };
+  };
+  const flattenProject = (
+    node: ConfigurationNode,
+    fa: FileAnalysis
+  ): { entry: ConfigEntry; fa: FileAnalysis }[] =>
+    flattenConfiguration<FileAnalysis>(node, fa, resolveConfig).entries.map((fe) => ({
+      entry: fe.entry,
+      fa: fe.file,
+    }));
 
   interface WiringEvent {
     entry: ConfigEntry;
@@ -580,15 +619,17 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   const allOverridesWithHome: { entry: OverrideEntry; fa: FileAnalysis }[] = [];
   for (const fa of analyses) {
     for (const node of fa.ast) {
-      const entries: ConfigEntry[] =
+      const flat: { entry: ConfigEntry; fa: FileAnalysis }[] =
         node.kind === "configuration"
-          ? node.entries
+          ? node.extendsNames === undefined
+            ? node.entries.map((entry) => ({ entry, fa }))
+            : flattenProject(node, fa)
           : node.kind === "standalone-bind" || node.kind === "standalone-override"
-          ? [node.entry]
+          ? [{ entry: node.entry, fa }]
           : [];
-      for (const e of entries) {
-        if (e.kind === "bind") allBindsWithHome.push({ entry: e, fa });
-        else allOverridesWithHome.push({ entry: e, fa });
+      for (const { entry: e, fa: eFa } of flat) {
+        if (e.kind === "bind") allBindsWithHome.push({ entry: e, fa: eFa });
+        else allOverridesWithHome.push({ entry: e, fa: eFa });
       }
     }
   }
@@ -722,14 +763,15 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
   // エントリ単位で「先行バリアに塞がれていなければイベント、塞がれていれば taint」。
   // entryFa は式の字句的な所属ファイル（activate なら configuration の宣言ファイル）、
   // (evSeq, evPos) は登録が走る位置（activate ならその activate 文の位置）。
-  const emitEntries = (
-    entryFa: FileAnalysis,
-    entries: ConfigEntry[],
+  // エントリごとに「宣言元ファイル」を伴う（継承で他ファイルから来たエントリは、その
+  // ファイルの字句環境で評価される＝ home が違う）。
+  const emitFlat = (
+    flat: { entry: ConfigEntry; fa: FileAnalysis }[],
     evSeq: number,
     evPos: number,
     blockedSuffix: string
   ): void => {
-    for (const entry of entries) {
+    for (const { entry, fa: entryFa } of flat) {
       if (orderAmbiguity !== null) {
         postBarrierWiring = true;
         taintEntries(entryFa, [entry], orderAmbiguity);
@@ -747,6 +789,9 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
       }
     }
   };
+  const taintFlat = (flat: { entry: ConfigEntry; fa: FileAnalysis }[], reason: string): void => {
+    for (const { entry, fa } of flat) taintEntries(fa, [entry], reason);
+  };
 
   // ファイル本体の処理（単一ファイル版の収集ループのプロジェクト合成版）。
   // イベントの位置は（評価順 seq, ファイル内トークン位置）で表し、フェーズ3b の
@@ -762,8 +807,12 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
     for (const node of fa.ast) {
       const pos = (node as { tokenPos?: number }).tokenPos ?? 0;
       if (node.kind === "configuration") {
+        const effective =
+          node.extendsNames === undefined
+            ? node.entries.map((entry) => ({ entry, fa }))
+            : flattenProject(node, fa);
         if (node.scope === "local") {
-          taintEntries(fa, node.entries, "bound in a local scope");
+          taintFlat(effective, "bound in a local scope");
         } else if (node.scope === "class") {
           // L1.5: 囲みクラスが特定できればフレームとして勝者計算に参加させる。
           const encl = enclosingTopLevelClass(fa.tokens, fa.classes, pos);
@@ -774,21 +823,21 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
               arr = [];
               classFramesByCanonClass.set(id, arr);
             }
-            arr.push({ entries: node.entries, fa });
-            for (const e of node.entries) {
+            arr.push({ entries: effective.map((x) => x.entry), fa });
+            for (const { entry: e, fa: eFa } of effective) {
               if (e.kind !== "override") continue;
-              const tCanon = canonClass(fa, e.className);
+              const tCanon = canonClass(eFa, e.className);
               const tDecl = /^C::(.+)::([^:]+)$/.exec(tCanon);
               const tInfo = tDecl !== null ? byNorm.get(tDecl[1])?.classes.get(tDecl[2]) : undefined;
               if (tInfo === undefined || tInfo.opaqueHeritage) {
-                taintOverrideEntry(fa, e, "class-scope override targets a class whose hierarchy is not statically analyzable");
+                taintOverrideEntry(eFa, e, "class-scope override targets a class whose hierarchy is not statically analyzable");
               }
             }
           } else {
-            taintEntries(fa, node.entries, "bound in a class scope of a non-top-level class");
+            taintFlat(effective, "bound in a class scope of a non-top-level class");
           }
         } else if (node.name === undefined) {
-          emitEntries(fa, node.entries, evSeq, pos, "");
+          emitFlat(effective, evSeq, pos, "");
         }
       } else if (node.kind === "activate") {
         // `activate Name from "path"` は相手ファイルの activate 関数の呼び出し。
@@ -827,11 +876,12 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
           );
         }
         if (cfg === undefined || cfgFa === undefined) continue; // プロジェクト外 → 共有レジストリに触れない
+        const cfgFlat = flattenProject(cfg, cfgFa);
         if (!fa.isTopLevel(pos)) {
           dynamicContextWiring = true;
-          taintEntries(cfgFa, cfg.entries, "activated inside a function or conditional");
+          taintFlat(cfgFlat, "activated inside a function or conditional");
         } else {
-          emitEntries(cfgFa, cfg.entries, evSeq, pos, " (before this activate)");
+          emitFlat(cfgFlat, evSeq, pos, " (before this activate)");
         }
       } else if (node.kind === "standalone-override" || node.kind === "standalone-bind") {
         const entry = node.kind === "standalone-override" ? node.entry : node.entry;
@@ -839,7 +889,7 @@ export function computeProjectWiring(files: DisonFileInput[]): Map<string, Proje
           dynamicContextWiring = true;
           taintEntries(fa, [entry], "wired inside a function");
         } else {
-          emitEntries(fa, [entry], evSeq, pos, "");
+          emitFlat([{ entry, fa }], evSeq, pos, "");
         }
       }
     }

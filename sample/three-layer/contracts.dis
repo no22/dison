@@ -1,0 +1,12 @@
+// Layer 1 — contracts. Nothing but types: no implementation, no wiring.
+// A file like this never needs to change when you swap implementations.
+//
+// See app.dis for how to run this sample.
+
+export interface Repository {
+  find(id: string): string;
+}
+
+export interface Clock {
+  now(): string;
+}

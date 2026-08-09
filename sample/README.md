@@ -82,6 +82,49 @@ Expected output:
 42 (postgres @ postgres://localhost/app)
 ```
 
+## three-layer/
+
+The layering Dison is built for, in four files: **contracts** (`interface`
+only), **implementations** (classes that know the contracts), **wiring**
+(`configuration`s that decide which implementation wins), and a **service**
+that declares what it needs and knows none of the above.
+
+Two 2.1 features make the separation complete:
+
+- `configuration Test extends Production { ... }` — configurations inherit
+  from each other, so `Test` states only its delta. Reuse and extension of
+  wiring, with no dependency on any class hierarchy.
+- `injectable repo: Repository;` — no default initializer naming an
+  implementation. It can be omitted whenever the wiring guarantees a
+  binding, so the declaration site no longer has to know one.
+
+`app.dis` composes by *placing* a configuration: an anonymous
+`configuration extends Production {}` splices that wiring into the scope
+it's written in. Nothing is imported from `wiring.dis` — Dison resolves the
+name across the project and injects whatever import the generated code
+needs. The whole project folds statically and imports no runtime.
+
+```bash
+npx dison --explain sample/three-layer/contracts.dis sample/three-layer/implementations.dis \
+          sample/three-layer/wiring.dis sample/three-layer/service.dis sample/three-layer/app.dis
+npx tsx sample/three-layer/app.ts
+```
+
+Write that same splice **inside a function** instead and it becomes a local
+scope — the wiring applies only within the block and is undone at the end:
+
+```dison
+export function underTest(): string {
+  configuration extends Test {}
+  return new ReportService().render("42");
+}
+```
+
+That keeps those keys on the runtime registry, by design: a scope that can
+be entered and left cannot be folded away. It's the same trade the
+[Static resolution](../README.md#static-resolution-new-in-20) section
+describes — declarative production wiring folds, dynamic test wiring stays.
+
 ## multi-file-collision/
 
 A 3-file project (`user-module.dis`, `admin-module.dis`, `main.dis`)

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'fs';
 import * as path from 'path';
-import { transpileDisonToTS, explainWiring, computeProjectWiring, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from './core.js'; // ※NodeNext環境のために.jsをつけます
+import { transpileDisonToTS, explainWiring, computeProjectWiring, findUnboundInjectables, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile, computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics } from './core.js'; // ※NodeNext環境のために.jsをつけます
 
 // 複数ファイルの生成コードが共有ランタイム（DI_REGISTRY/TYPE_BINDINGS等）を
 // importする際に使うパッケージのサブパス。@no22/disonパッケージ自身が
@@ -92,6 +92,27 @@ function transpileMultipleFiles(inputFiles: string[], opts: CliOptions): void {
     );
   }
 
+  // configuration 継承の診断（未解決の親・循環・兄弟衝突）。
+  const configDiags = findConfigInheritanceDiagnostics(fileInputs);
+  if (configDiags.length > 0) {
+    const details = configDiags.map((c) => `  - ${c.message}`).join('\n');
+    throw new Error(
+      `configuration inheritance problems detected (${configDiags.length}).` +
+        ` No files were generated.\n${details}`
+    );
+  }
+
+  // 既定初期化式を省略した injectable の束縛被覆チェック（プロジェクト全体。
+  // docs/injectable-default-relaxation.md §2.1）。
+  const unbound = findUnboundInjectables(fileInputs);
+  if (unbound.length > 0) {
+    const details = unbound.map((c) => `  - ${c.message}`).join('\n');
+    throw new Error(
+      `Injectables without a default initializer have no guaranteed binding (${unbound.length}).` +
+        ` No files were generated.\n${details}`
+    );
+  }
+
   console.log(`🎉 Using "${RUNTIME_PACKAGE_SPECIFIER}" as the shared runtime (the target project must have "dison" installed as a dependency).`);
 
   // 各ファイルが他のプロジェクトファイルからvalue-importしている具象クラスを解決し、
@@ -108,6 +129,10 @@ function transpileMultipleFiles(inputFiles: string[], opts: CliOptions): void {
   // DI利用される companion を emit・export し、import 側にはその import を注入する。
   const companionPlanByFile = computeCompanionPlanByFile(fileInputs);
 
+  // configuration の継承がファイルを跨ぐ場合の applier/import 計画
+  // （docs/configuration-inheritance.md §3.2）。
+  const configExtendsPlanByFile = computeConfigExtendsPlanByFile(fileInputs);
+
   for (const file of fileInputs) {
     const companionPlan = companionPlanByFile.get(file.path);
     const generatedTS = transpileDisonToTS(file.source, {
@@ -116,6 +141,8 @@ function transpileMultipleFiles(inputFiles: string[], opts: CliOptions): void {
       companionEmit: companionPlan?.companionEmit,
       companionImports: companionPlan?.companionImports,
       projectWiring: projectWiring?.get(file.path),
+      configApplierEmit: configExtendsPlanByFile.get(file.path)?.applierEmit,
+      configExtendsImports: configExtendsPlanByFile.get(file.path)?.extendsImports,
     });
     const outputFile = outputPathFor(file.path);
     fs.writeFileSync(outputFile, generatedTS, 'utf-8');

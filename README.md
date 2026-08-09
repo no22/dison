@@ -85,9 +85,18 @@ class UserService {
 }
 ```
 
-For types that can't be auto-constructed with `new`
-(`interface`, `type` alias, `abstract class`, array/union/function
-types), a default initializer is required:
+Types that can't be auto-constructed with `new` need a resolution to come
+from somewhere. Either bind them...
+
+```dison
+class UserService {
+  injectable repo: IUserRepository;                       // new in 2.1
+}
+
+configuration { bind IUserRepository = SqlUserRepository; }
+```
+
+...or give a default initializer:
 
 ```dison
 class UserService {
@@ -95,12 +104,23 @@ class UserService {
 }
 ```
 
+Omitting the initializer (new in 2.1) requires a binding that is
+*unconditionally* active — a top-level `configuration`/`bind`/`activate`, or
+a class-scope configuration on the class's own prototype chain. If there is
+none, the build fails with a message telling you to add either. This is what
+lets an `interface` and the class that declares it need no knowledge of any
+implementation; the `configuration` layer decides. Array, union and function
+types can't participate in `bind` at all, so they still always require an
+initializer.
+
 ### `configuration` / `activate`
 
 Groups a set of `override`/`bind` statements. A **named** configuration
-is activated explicitly with `activate`. Naming and `activate` are a
-**global-scope-only** feature — see [Scoped configuration](#scoped-configuration-new-in-120)
-below for local/class scopes, which use anonymous configurations instead:
+is activated explicitly with `activate`, which always applies to the global
+scope. Local and class scopes are written as anonymous configurations
+(see [Scoped configuration](#scoped-configuration-new-in-120)) — and since
+2.1 they can pull in a named configuration's wiring with
+[`extends`](#placing-a-configuration-anonymous-extends-new-in-21):
 
 ```dison
 configuration TestConfig {
@@ -115,6 +135,63 @@ To activate a configuration defined in another file:
 ```dison
 activate TestConfig from "./configs";
 ```
+
+#### Reuse and composition: `extends` (new in 2.1)
+
+A configuration can inherit another one and state only its **delta**. This
+makes wiring reusable and composable without depending on any class
+hierarchy — configurations are just named bags of wiring:
+
+```dison
+configuration Production {
+  bind Repository = PostgresRepository(DATABASE_URL);
+  bind Clock = SystemClock;
+}
+
+configuration Test extends Production {
+  bind Repository = InMemoryRepository;   // Clock comes from Production
+}
+```
+
+Multiple parents are allowed (`configuration Full extends Base, Logging`).
+Later wins: a child overrides its parents, and a right-hand parent overrides
+a left-hand one. If two parents that are unrelated to each other wire the
+same key, that is a build error rather than a silent coin flip — the child
+must wire it explicitly to say which one it wants. Cycles are a build error
+too.
+
+#### Placing a configuration: anonymous `extends` (new in 2.1)
+
+Naming a configuration decides **what** the wiring is; *where you write it*
+decides **how far it reaches** (see [Scoped configuration](#scoped-configuration-new-in-120)).
+Those two are independent, and an anonymous `configuration extends X { }`
+is how you combine them: it splices `X`'s wiring into the scope it is
+written in.
+
+```dison
+configuration extends Production {}                      // top level → global
+
+class Service {
+  configuration extends CachingWiring {}                 // class body → class scope
+}
+
+function underTest() {
+  configuration extends Test {}                          // function body → local scope
+  ...                                                    // undone at the end of the block
+}
+
+configuration extends Test { bind Clock = SystemClock; } // splice, plus a delta
+```
+
+In a multi-file project you don't import the configuration: Dison resolves
+the name across the project and injects whatever import the generated code
+needs, the same way it handles companion symbols.
+
+`activate` keeps its own meaning — an explicit, *dynamic* switch that applies
+to the global scope wherever it runs, including inside functions and
+conditionals. Reach for `configuration extends` when you want declarative,
+lexical wiring (it also folds statically); reach for `activate` when you
+genuinely want to decide at runtime.
 
 #### Forward references (new in 1.5.0)
 
@@ -187,13 +264,13 @@ generator instead.
 > code that uses them needs `Symbol.dispose` (TypeScript 5.2+ / Node 20+)
 > and `node:async_hooks` at runtime. See [Requirements](#requirements).
 
-*(Naming a configuration and activating it by name is a global-scope-only
-feature, by design — local and class scopes only take an anonymous
-`configuration { ... }`, which is auto-active for the scope it's written
-in. This isn't a gap to be filled later: the dynamic, explicit-activation
-model that named configurations need doesn't fit scopes that are already
-tied lexically to a block or class, so it's intentionally not offered
-there.)*
+*(Only anonymous configurations can be written in a local or class scope,
+and they are auto-active there. Naming a configuration and activating it by
+name stays global-scope-only, by design: the dynamic, explicit-activation
+model that `activate` provides doesn't fit scopes that are already tied
+lexically to a block or class. Reuse across scopes is served instead by
+[`configuration extends`](#placing-a-configuration-anonymous-extends-new-in-21),
+which keeps naming for reuse and position for scope.)*
 
 ### `override`
 
@@ -420,7 +497,8 @@ See [`sample/`](sample/) for runnable, self-contained examples covering
 `injectable`/`override`/`activate`, `bind` (including generics and
 chaining), the declarative-header style and class scopes folded by
 static resolution, a central-config project wired across files with
-zero runtime dependencies, and a multi-file project where two files
+zero runtime dependencies, a four-file project separating contracts /
+implementations / wiring / consumers, and a multi-file project where two files
 declare their own same-named `IRepository` interface and Dison keeps
 them apart automatically — no tokens needed.
 

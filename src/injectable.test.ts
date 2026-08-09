@@ -38,7 +38,7 @@ class S {
 });
 
 describe("injectable: 危険な型には既定初期化式 '= 式' が必須", () => {
-  it("interface型に '= 式' が無いとパースエラーになる", () => {
+  it("interface型は '= 式' が無くても、束縛が無ければ被覆チェックのエラーになる（2.1で緩和）", () => {
     expect(() =>
       transpileDisonToTS(`
 interface IRepo { find(): void; }
@@ -56,7 +56,7 @@ class S { injectable dep: IRepo = new Impl(); }
     expect(out).toContain("new Impl()");
   });
 
-  it("type エイリアスに '= 式' が無いとパースエラーになる", () => {
+  it("type エイリアスは '= 式' が無くても、束縛が無ければ被覆チェックのエラーになる（2.1で緩和）", () => {
     expect(() =>
       transpileDisonToTS(`
 type Handler = { run(): void };
@@ -65,7 +65,7 @@ class S { injectable dep: Handler; }
     ).toThrow(/default initializer/);
   });
 
-  it("abstract classに '= 式' が無いとパースエラーになる", () => {
+  it("abstract classは '= 式' が無くても、束縛が無ければ被覆チェックのエラーになる（2.1で緩和）", () => {
     expect(() =>
       transpileDisonToTS(`
 abstract class Base { abstract greet(): string; }

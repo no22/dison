@@ -49,7 +49,12 @@ export type Node =
   // asyncScope: scope==="local" で囲み関数がasyncの場合true。脱糖形に暗黙の
   // サスペンション（await null）を挿入して呼び出し元への漏れを防ぐ
   // （docs/async-local-scope.md）。
-  | { kind: "configuration"; name?: string; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[]; tokenPos?: number }
+  // extendsNames: `configuration [Name] extends A, B { ... }` の継承元
+  // （docs/configuration-inheritance.md）。名前で参照した configuration の
+  // エントリを取り込む。無名に付けた場合は「その位置への展開」になる。
+  // entries は書かれたとおりを保持し、平坦化はしない（パーサは他ファイルの
+  // 親を解決できないため。平坦化は config-inheritance.ts が行う）。
+  | { kind: "configuration"; name?: string; extendsNames?: string[]; scope: "global" | "local" | "class"; asyncScope?: boolean; entries: ConfigEntry[]; tokenPos?: number }
   // token: "injectable prop: Type as Token = ...;" のas句（bindと同じ役割）。
   | { kind: "injectable"; propName: string; typeName: string; typeKey: string; defaultExpr?: string; token?: string; tokenPos?: number }
   // token Name; -> export const Name = Symbol("Name"); に脱糖される

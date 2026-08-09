@@ -58,7 +58,9 @@ export function collectConfigurationNames(tokens: Token[]): Set<string> {
     if (t.type === "keyword" && t.text === "configuration") {
       let j = idx + 1;
       while (j < tokens.length && (tokens[j].type === "whitespace" || tokens[j].type === "comment")) j++;
-      if (j < tokens.length && tokens[j].type === "ident") {
+      // "configuration extends A { ... }"（無名＋継承節）の "extends" を
+      // configuration 名として誤登録しない（docs/configuration-inheritance.md §1.1）。
+      if (j < tokens.length && tokens[j].type === "ident" && tokens[j].text !== "extends") {
         names.add(tokens[j].text);
       }
     }
@@ -376,7 +378,22 @@ export function baseIdentifierOf(typeName: string): string {
 //     abstract class として宣言されていると判定できた場合は危険
 //     （宣言マージで同名の非abstract classが別途あれば安全側に倒す）。
 export function isRiskyInjectableType(typeKey: string, typeKinds: DeclaredTypeKinds): boolean {
-  if (!isSimpleTypeShape(typeKey)) return true;
+  return isUnconstructibleShape(typeKey) || isNonNewableSimpleType(typeKey, typeKinds);
+}
+
+// 配列・ユニオン・関数型など「識別子＋ジェネリクス」の形をしていない型。
+// codegen はこの形の injectable に resolveType を出さない（bind に参加しない）ため、
+// 束縛で解決される道が原理的に無い。したがって既定初期化式は**必須のまま**であり、
+// パース時のハードエラーで早く弾く（docs/injectable-default-relaxation.md §1.3）。
+export function isUnconstructibleShape(typeKey: string): boolean {
+  return !isSimpleTypeShape(typeKey);
+}
+
+// 「識別子（＋ジェネリクス）の形をしているが new できない型」= 真の interface /
+// 型エイリアス / abstract class。bind で解決できるため、束縛が保証されていれば
+// 既定初期化式を省略できる（docs/injectable-default-relaxation.md）。
+export function isNonNewableSimpleType(typeKey: string, typeKinds: DeclaredTypeKinds): boolean {
+  if (!isSimpleTypeShape(typeKey)) return false;
   const base = baseIdentifierOf(typeKey);
   return typeKinds.nonNewableTypeNames.has(base) && !typeKinds.classNames.has(base);
 }

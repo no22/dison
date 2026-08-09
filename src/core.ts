@@ -236,7 +236,7 @@
  */
 
 import { Lexer } from "./lexer.js";
-import { collectDeclaredTypeKinds, trueInterfaceOrAliasNames, identityKeyableClassNames, collectBlockContext } from "./analysis.js";
+import { collectDeclaredTypeKinds, trueInterfaceOrAliasNames, identityKeyableClassNames, collectBlockContext, isNonNewableSimpleType } from "./analysis.js";
 import { Parser } from "./parser.js";
 import {
   generate,
@@ -246,6 +246,8 @@ import {
   generateCompanionImportStatements,
   collectDiUsedTypeNames,
   companionName,
+  configApplierName,
+  keyExprFor,
   type KeyStrategy,
   type CompanionImport,
 } from "./codegen.js";
@@ -253,8 +255,10 @@ import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE, DISON_RUNTIME
 import { computeWiringTable, type WiringTable, type WiringDecision } from "./static-wiring.js";
 import type { Node as DisonNode } from "./ast.js";
 import { computeProjectWiring, type ProjectFileWiring } from "./static-wiring-project.js";
-import { findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile } from "./collisions.js";
-import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo } from "./collisions.js";
+import { namedGlobalConfigurations, configurationsNeedingApplier, collectInheritanceDiagnostics, overridePairKeys } from "./config-inheritance.js";
+import { findUnboundInjectables } from "./binding-coverage.js";
+import { findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile, computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics } from "./collisions.js";
+import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo, ConfigExtendsPlan } from "./collisions.js";
 
 export interface TranspileOptions {
   // 指定すると、ランタイムの前置き（DI_REGISTRY等）をインライン生成する代わりに、
@@ -294,6 +298,17 @@ export interface TranspileOptions {
   // の配線が届くため、このファイル単独では判定できない。CLI がプロジェクト全体を
   // 解析した結果（computeProjectWiring）を projectWiring で渡してきた場合のみ畳む。
   staticResolution?: boolean;
+
+  // このファイルで宣言された configuration のうち、他ファイルのローカル/クラス
+  // スコープへ展開されるため applier（__dison_config_X）を export すべき名前
+  // （docs/configuration-inheritance.md §3.2）。companionEmit と同じ位置づけで
+  // CLI が計算して渡す。
+  configApplierEmit?: Iterable<string>;
+
+  // このファイルの `configuration ... extends X` が他ファイルの X を参照する場合の
+  // import 情報。needsApplier ならフレーム用の applier を、そうでなければ
+  // activateX を import する。
+  configExtendsImports?: Map<string, { specifier: string; needsApplier: boolean }>;
 
   // 複数ファイルモードの静的解決（フェーズ2）。CLI が computeProjectWiring で
   // プロジェクト全体を解析し、このファイルのスライスを渡す。injectable の判定は
@@ -361,7 +376,63 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
     };
   }
 
-  const body = generate(ast, fromBindings, strategy, wiring);
+  // configuration の継承（docs/configuration-inheritance.md）。ローカル/クラススコープへ
+  // 展開される configuration は applier 形で emit する必要がある。
+  const namedConfigs = namedGlobalConfigurations(ast);
+  const applierEmit = new Set<string>([
+    ...configurationsNeedingApplier(ast, (name) => namedConfigs.get(name)),
+    ...(options.configApplierEmit ?? []),
+  ]);
+  const extendsImports =
+    options.configExtendsImports ?? new Map<string, { specifier: string; needsApplier: boolean }>();
+
+  // 継承の循環・兄弟衝突の診断（docs/configuration-inheritance.md §2.2/§2.3）。
+  // 複数ファイルモードでは CLI がプロジェクト全体で行うので、ここでは行わない
+  // （他ファイルの親が見えず「解決できない」誤検出になるため）。
+  if (options.runtimeModulePath === undefined && options.projectWiring === undefined) {
+    const diags = collectInheritanceDiagnostics<undefined>(
+      ast,
+      undefined,
+      (name) => {
+        const decl = namedConfigs.get(name);
+        return decl !== undefined ? { node: decl, file: undefined } : undefined;
+      },
+      {
+        bindKey: (entry) => keyExprFor(entry.originalTypeKey, entry.token, strategy),
+        overrideKeys: (entry) => overridePairKeys(entry.className, entry),
+      }
+    );
+    if (diags.length > 0) throw new Error(diags.map((d) => d.message).join("\n"));
+  }
+
+  // フレームへの展開（関数本体・クラス本体の `configuration extends X {}`）は、X の
+  // エントリをコールバック経由で適用する必要があるため、X の宣言が見えていなければ
+  // 生成できない。単一ファイルモードで他ファイルの configuration を参照した場合が該当。
+  for (const node of ast) {
+    if (node.kind !== "configuration" || node.scope === "global") continue;
+    for (const parent of node.extendsNames ?? []) {
+      if (namedConfigs.has(parent) || extendsImports.has(parent)) continue;
+      throw new Error(
+        `Dison: configuration "${parent}" is extended by a local/class-scope configuration, ` +
+          `but its declaration is not visible here. Declare it in this file, or pass the file that ` +
+          `declares it to the CLI as well (multi-file mode).`
+      );
+    }
+  }
+
+  // 既定初期化式を省略した injectable の束縛被覆チェック（単一ファイルモードのみ。
+  // 複数ファイルモードでは他ファイルの configuration が束縛しうるため CLI が
+  // プロジェクト全体で検査する。docs/injectable-default-relaxation.md §2.1）。
+  if (options.runtimeModulePath === undefined && options.projectWiring === undefined) {
+    const unbound = findUnboundInjectables([{ path: "<input>", source: sourceCode }]);
+    if (unbound.length > 0) {
+      throw new Error(unbound.map((d) => d.message.replace("<input>: ", "")).join("\n"));
+    }
+  }
+
+  const body = generate(ast, fromBindings, strategy, wiring, applierEmit, (n) =>
+    isNonNewableSimpleType(n.typeKey, typeKinds)
+  );
 
   // emit する companion = このファイルで DI利用されるローカル真 interface
   // ∪ 呼び出し側が渡した追加分（他ファイルで DI利用されるローカル宣言）。
@@ -398,7 +469,7 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
         header
       : `${header}import {\n` +
       `  bindTypeLazy,\n  resolveType,\n  registerOverrideLazy,\n` +
-      `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScopeLazy,\n  __disonBuildFrameLazy,\n` +
+      `  __disonCurrentScope,\n  __disonResolveInjectable,\n  __disonEnterScopeLazy,\n  __disonBuildFrameLazy,\n  __disonApplyToGlobal,\n` +
       `} from ${JSON.stringify(options.runtimeModulePath)};\n\n`
     : wiring !== undefined && !wiring.needsRuntime
     ? // 静的解決が全 injectable を畳み、登録も不要と証明した場合はランタイム前置きを
@@ -420,6 +491,18 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   // （docs/static-resolution-design.md §8。式の字句的な所属ファイル側に export を
   // 生成し、利用側のゲッターは static import した関数を直接呼ぶ）。
   const pw = options.projectWiring;
+  // extends が他ファイルの configuration を参照する場合の import
+  // （docs/configuration-inheritance.md §3.2）。
+  const extendsImportsStr =
+    extendsImports.size > 0
+      ? [...extendsImports]
+          .map(
+            ([name, info]) =>
+              `import { ${info.needsApplier ? configApplierName(name) : `activate${name}`} } from ${JSON.stringify(info.specifier)};`
+          )
+          .join("\n") + "\n\n"
+      : "";
+
   const factoryImportsStr =
     pw !== undefined && pw.factoryImports.length > 0
       ? pw.factoryImports
@@ -437,7 +520,7 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
         "\n"
       : "";
 
-  return prelude + companionImportsStr + fromImports + factoryImportsStr + companionDecls + body + factoryExportsStr;
+  return prelude + companionImportsStr + fromImports + extendsImportsStr + factoryImportsStr + companionDecls + body + factoryExportsStr;
 }
 
 /**
@@ -464,6 +547,8 @@ export function explainWiring(sourceCode: string): string[] {
 // 公開API: 複数ファイル対応（docs/multi-file-support.md、
 // docs/bind-interface-token.md）。CLIが複数ファイルを一括処理する際に使う。
 export { DISON_RUNTIME_MODULE_SOURCE, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile };
-export { computeProjectWiring };
+export { computeProjectWiring, findUnboundInjectables };
+export { computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics };
+export type { ConfigExtendsPlan };
 export type { ProjectFileWiring };
 export type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo };

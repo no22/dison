@@ -1,0 +1,20 @@
+// Layer 3 — wiring. The only place that decides which implementation wins.
+// `configuration ... extends ...` (new in 2.1) makes these reusable and
+// composable without depending on any class hierarchy: Test inherits all of
+// Production's wiring and states only its delta.
+
+import type { Repository, Clock } from "./contracts";
+import { PostgresRepository, InMemoryRepository, SystemClock, FrozenClock } from "./implementations";
+
+const DATABASE_URL = "postgres://localhost/app";
+
+export configuration Production {
+  bind Repository = PostgresRepository(DATABASE_URL);
+  bind Clock = SystemClock;
+}
+
+// Only the differences. Everything else comes from Production.
+export configuration Test extends Production {
+  bind Repository = InMemoryRepository;
+  bind Clock = FrozenClock("2026-01-01T00:00:00Z");
+}

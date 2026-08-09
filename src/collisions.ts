@@ -15,6 +15,7 @@ import {
   baseIdentifierOf,
 } from "./analysis.js";
 import { collectDiUsedTypeNames } from "./codegen.js";
+import { collectInheritanceDiagnostics, overridePairKeys } from "./config-inheritance.js";
 import { Parser } from "./parser.js";
 
 export interface DisonFileInput {
@@ -485,5 +486,155 @@ export function findBindCollisions(files: DisonFileInput[]): BindCollisionDiagno
     }
   }
 
+  return diagnostics;
+}
+
+
+/**
+ * 複数ファイルモードで、`configuration ... extends X` がファイルを跨ぐ場合の計画
+ * （docs/configuration-inheritance.md §3.2）。companion 計画と同じ位置づけで CLI が計算し、
+ * 各ファイルの transpile に渡す。
+ *
+ *   - applierEmit: そのファイルが export すべき applier（__dison_config_X）の名前。
+ *     他ファイルのローカル/クラススコープへ展開される configuration が対象。
+ *   - extendsImports: そのファイルが import すべき参照（フレーム展開なら applier、
+ *     グローバル展開なら activateX）。
+ */
+export interface ConfigExtendsPlan {
+  applierEmit: Set<string>;
+  extendsImports: Map<string, { specifier: string; needsApplier: boolean }>;
+}
+
+export function computeConfigExtendsPlanByFile(files: DisonFileInput[]): Map<string, ConfigExtendsPlan> {
+  interface Pre {
+    file: DisonFileInput;
+    norm: string;
+    ast: ReturnType<Parser["parseProgram"]>;
+    named: Map<string, Extract<ReturnType<Parser["parseProgram"]>[number], { kind: "configuration" }>>;
+  }
+  const pre: Pre[] = files.map((file) => {
+    const tokens = new Lexer(file.source).tokenize();
+    const kinds = collectDeclaredTypeKinds(tokens);
+    const ast = new Parser(tokens, kinds).parseProgram();
+    const named = new Map<string, any>();
+    for (const n of ast) {
+      if (n.kind === "configuration" && n.scope === "global" && n.name !== undefined) named.set(n.name, n);
+    }
+    return { file, norm: normalizeExtensionlessAbsolutePath(file.path), ast, named };
+  });
+
+  const declOf = (name: string, from: Pre): Pre | undefined =>
+    from.named.has(name) ? from : pre.find((p) => p.named.has(name));
+
+  const result = new Map<string, ConfigExtendsPlan>();
+  for (const p of pre) result.set(p.file.path, { applierEmit: new Set(), extendsImports: new Map() });
+
+  // 参照を辿り、必要な applier / import を積む。継承は推移するので親も辿る。
+  const need = (name: string, from: Pre, asApplier: boolean, stack: string[]): void => {
+    if (stack.includes(name)) return;
+    const decl = declOf(name, from);
+    if (decl === undefined) return;
+    if (asApplier) result.get(decl.file.path)!.applierEmit.add(name);
+    if (decl.norm !== from.norm) {
+      const rel = relativeSpecifier(from.file.path, decl.norm);
+      const plan = result.get(from.file.path)!;
+      const existing = plan.extendsImports.get(name);
+      plan.extendsImports.set(name, {
+        specifier: rel,
+        needsApplier: asApplier || existing?.needsApplier === true,
+      });
+    }
+    // 親も同じ形（applier が要るなら親の applier も要る）で辿る。
+    const node = decl.named.get(name)!;
+    for (const parent of node.extendsNames ?? []) need(parent, decl, asApplier, [...stack, name]);
+  };
+
+  for (const p of pre) {
+    for (const n of p.ast) {
+      if (n.kind !== "configuration") continue;
+      const frameForm = n.scope !== "global";
+      for (const parent of n.extendsNames ?? []) need(parent, p, frameForm, []);
+    }
+  }
+  return result;
+}
+
+// import specifier を組み立てる（プロジェクト内 import の拡張子スタイルは
+// 静的解決側と同様に "./x" 形を既定にする）。
+function relativeSpecifier(fromFile: string, toNorm: string): string {
+  let rel = path.relative(path.dirname(fromFile), toNorm).split(path.sep).join("/");
+  if (!rel.startsWith(".")) rel = `./${rel}`;
+  return rel;
+}
+
+
+/**
+ * 複数ファイルモードでの configuration 継承の診断（未解決の親・循環・兄弟衝突）。
+ * docs/configuration-inheritance.md §2.2/§2.3。
+ */
+export function findConfigInheritanceDiagnostics(files: DisonFileInput[]): BindCollisionDiagnostic[] {
+  interface Pre {
+    file: DisonFileInput;
+    norm: string;
+    ast: ReturnType<Parser["parseProgram"]>;
+    named: Map<string, any>;
+    identityClasses: Set<string>;
+    companionTypes: Set<string>;
+  }
+  const classIndex = buildProjectClassIndex(files);
+  const interfaceIndex = buildProjectInterfaceIndex(files);
+  const pre: Pre[] = files.map((file) => {
+    const tokens = new Lexer(file.source).tokenize();
+    const kinds = collectDeclaredTypeKinds(tokens);
+    const ast = new Parser(tokens, kinds).parseProgram();
+    const named = new Map<string, any>();
+    for (const n of ast) {
+      if (n.kind === "configuration" && n.scope === "global" && n.name !== undefined) named.set(n.name, n);
+    }
+    const identityClasses = identityKeyableClassNames(kinds);
+    for (const n of importedProjectClassLocalNames(file, classIndex)) identityClasses.add(n);
+    const companionTypes = trueInterfaceOrAliasNames(kinds);
+    for (const localName of importedProjectInterfaceLocalNames(file, interfaceIndex).keys()) {
+      companionTypes.add(localName);
+    }
+    return { file, norm: normalizeExtensionlessAbsolutePath(file.path), ast, named, identityClasses, companionTypes };
+  });
+
+  const resolve = (name: string, from: Pre) => {
+    const own = from.named.get(name);
+    if (own !== undefined) return { node: own, file: from };
+    const other = pre.find((p) => p.named.has(name));
+    return other !== undefined ? { node: other.named.get(name)!, file: other } : undefined;
+  };
+
+  // キーはプロジェクト横断で比較できる形（宣言ファイル::名前）に寄せる。
+  const declSite = (p: Pre, name: string): string => {
+    if (p.identityClasses.has(name) || p.companionTypes.has(name)) {
+      const tokens = new Lexer(p.file.source).tokenize();
+      for (const imp of collectImportBindings(tokens)) {
+        if (imp.localName !== name || !imp.specifier.startsWith(".")) continue;
+        const resolved = normalizeExtensionlessAbsolutePath(
+          path.resolve(path.dirname(p.file.path), imp.specifier)
+        );
+        if (classIndex.has(resolved) || interfaceIndex.has(resolved)) return `${resolved}::${imp.importedName}`;
+      }
+      return `${p.norm}::${name}`;
+    }
+    return name;
+  };
+
+  const diagnostics: BindCollisionDiagnostic[] = [];
+  const seen = new Set<string>();
+  for (const p of pre) {
+    for (const d of collectInheritanceDiagnostics<Pre>(p.ast, p, resolve, {
+      bindKey: (entry, f) => `bind ${declSite(f, baseIdentifierOf(entry.originalTypeKey))}${entry.token ?? ""}`,
+      overrideKeys: (entry, f) => overridePairKeys(declSite(f, entry.className), entry),
+    })) {
+      const message = `${p.file.path}: ${d.message}`;
+      if (seen.has(message)) continue;
+      seen.add(message);
+      diagnostics.push({ name: "configuration", message });
+    }
+  }
   return diagnostics;
 }

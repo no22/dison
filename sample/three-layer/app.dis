@@ -1,0 +1,25 @@
+// Composition: the application picks a configuration by *placing* it.
+// An anonymous `configuration extends X {}` splices X's wiring into the
+// scope it is written in — global, here. Note that nothing is imported from
+// ./wiring: Dison resolves the configuration by name across the project and
+// injects whatever import the generated code needs.
+//
+//   npx dison sample/three-layer/contracts.dis sample/three-layer/implementations.dis \
+//             sample/three-layer/wiring.dis sample/three-layer/service.dis sample/three-layer/app.dis
+//   npx tsx sample/three-layer/app.ts
+//
+// Add --explain to see that every injectable folds to a direct construction.
+// The generated files import no runtime at all: this whole four-layer project
+// compiles to plain TypeScript with zero dependencies.
+//
+// Swapping to the test wiring is a one-line edit here (`extends Test`), or —
+// if you want both in one program — write `configuration extends Test {}`
+// inside a function to get a local scope. That keeps those keys on the
+// registry by design, so the wiring can be undone at the end of the block;
+// see the note in sample/README.md.
+
+import { ReportService } from "./service";
+
+configuration extends Production {}
+
+console.log("production:", new ReportService().render("42"));

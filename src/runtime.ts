@@ -190,6 +190,18 @@ export function generateRuntimeDeclarations(
     `}\n` +
     `${E}function registerOverride(cls: Function, prop: string, factory: __DisonFactory): void {\n` +
     `  __disonPendOverride(__DISON_GLOBAL, () => cls, prop, factory);\n` +
+    `}\n` +
+    `// Apply a configuration's entries to the global registry. A named configuration that is\n` +
+    `// also spliced into a local/class scope is emitted as an "applier" taking the same\n` +
+    `// bind/override callbacks a frame setup receives, so one function serves every scope\n` +
+    `// (docs/configuration-inheritance.md). activateX() routes that applier to the globals.\n` +
+    `${E}function __disonApplyToGlobal(\n` +
+    `  apply: (bind: (key: () => __DisonKey, factory: __DisonFactory) => void, override: (cls: () => Function, prop: string, factory: __DisonFactory) => void) => void\n` +
+    `): void {\n` +
+    `  apply(\n` +
+    `    (key, factory) => { __disonPendBind(__DISON_GLOBAL, key, factory); },\n` +
+    `    (cls, prop, factory) => { __disonPendOverride(__DISON_GLOBAL, cls, prop, factory); }\n` +
+    `  );\n` +
     `}\n\n` +
     `// Override target matching walks the prototype chain of the receiver's class\n` +
     `// (child -> parent, child-wins): an override targeting a base class applies to\n` +

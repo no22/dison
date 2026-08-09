@@ -8,6 +8,7 @@ import {
   computeProjectWiring,
   computeIdentityKeyClassesByFile,
   computeCompanionPlanByFile,
+  computeConfigExtendsPlanByFile,
 } from "./core";
 import type { DisonFileInput } from "./collisions";
 
@@ -32,6 +33,7 @@ function transpileProject(
   const wiring = computeProjectWiring(inputs);
   const identityByFile = computeIdentityKeyClassesByFile(inputs);
   const companionByFile = computeCompanionPlanByFile(inputs);
+  const extendsByFile = computeConfigExtendsPlanByFile(inputs);
   const outputs = new Map<string, string>();
   for (const f of inputs) {
     const plan = companionByFile.get(f.path);
@@ -44,6 +46,8 @@ function transpileProject(
         companionImports: plan?.companionImports,
         projectWiring: opts.noStatic ? undefined : wiring.get(f.path),
         staticResolution: opts.noStatic ? false : undefined,
+        configApplierEmit: extendsByFile.get(f.path)?.applierEmit,
+        configExtendsImports: extendsByFile.get(f.path)?.extendsImports,
       })
     );
   }
@@ -418,6 +422,87 @@ export const results = [new X().p.tag, new D().q.tag];
     expect(folded.results).toEqual(["cached", "real"]);
     const dynamic = runProject(transpileProject(files, { noStatic: true }).outputs, "main.ts");
     expect(dynamic.results).toEqual(["cached", "real"]);
+  });
+});
+
+describe("2.1: configuration extends のクロスファイル展開（3層分離）", () => {
+  const files = {
+    "contracts.dis": `
+export interface Repository { find(id: string): string; }
+export interface Clock { now(): string; }
+`,
+    "impl.dis": `
+import type { Repository, Clock } from "./contracts";
+export class PgRepository implements Repository { constructor(private url: string) {} find(id: string) { return id + "@" + this.url; } }
+export class MemRepository implements Repository { find(id: string) { return id + "@mem"; } }
+export class SystemClock implements Clock { now() { return "sys"; } }
+`,
+    "wiring.dis": `
+import type { Repository, Clock } from "./contracts";
+import { PgRepository, MemRepository, SystemClock } from "./impl";
+const DB_URL = "postgres://app";
+export configuration Production { bind Repository = PgRepository(DB_URL); bind Clock = SystemClock; }
+export configuration Test extends Production { bind Repository = MemRepository; }
+`,
+    "service.dis": `
+import type { Repository, Clock } from "./contracts";
+export class ReportService {
+  injectable repo: Repository;
+  injectable clock: Clock;
+  render(id: string): string { return "[" + this.clock.now() + "] " + this.repo.find(id); }
+}
+`,
+    "main.dis": `
+import { ReportService } from "./service";
+configuration extends Production {}
+export const results = [new ReportService().render("42")];
+`,
+  };
+
+  it("契約・実装・配線・利用が分離したまま全体が畳まれ、ランタイム依存が消える", () => {
+    const { outputs, wiring } = transpileProject(files);
+    for (const [name, w] of wiring) expect(w.needsRuntimeImport, name).toBe(false);
+    for (const [, out] of outputs) expect(out).not.toContain('from "dison/runtime"');
+    // service.dis は既定初期化式なしの interface 型 injectable（2.1の緩和）を持つ。
+    expect(files["service.dis"]).toContain("injectable repo: Repository;");
+    // 勝者式は wiring.dis の字句環境（DB_URL）を参照するので factory hoisting される。
+    expect(outputs.get("service.dis")!).toMatch(/this\._repo = __dison_factory_\d+\(\);/);
+    expect(outputs.get("wiring.dis")!).toMatch(/export function __dison_factory_\d+\(\) \{ return \(new PgRepository\(DB_URL\)\); \}/);
+  });
+
+  it("extends の import は生成側が注入する（利用者は書かない）", () => {
+    const { outputs } = transpileProject(files);
+    expect(files["main.dis"]).not.toContain('from "./wiring"');
+    expect(outputs.get("main.dis")!).toContain('import { activateProduction } from "./wiring";');
+  });
+
+  it("実行結果は --no-static と一致する", () => {
+    const folded = runProject(transpileProject(files).outputs, "main.ts");
+    const dynamic = runProject(transpileProject(files, { noStatic: true }).outputs, "main.ts");
+    expect(folded.results).toEqual(["[sys] 42@postgres://app"]);
+    expect(dynamic.results).toEqual(["[sys] 42@postgres://app"]);
+  });
+
+  it("ローカルスコープへのクロスファイル展開は applier 経由で動的に残る", () => {
+    const withTest = {
+      ...files,
+      "main.dis": `
+import { ReportService } from "./service";
+configuration extends Production {}
+export function underTest(): string {
+  configuration extends Test {}
+  return new ReportService().render("42");
+}
+export const results = [new ReportService().render("42"), underTest()];
+`,
+    };
+    const { outputs } = transpileProject(withTest);
+    expect(outputs.get("wiring.dis")!).toContain("export function __dison_config_Test(");
+    expect(outputs.get("main.dis")!).toContain('import { __dison_config_Test } from "./wiring";');
+    const folded = runProject(outputs, "main.ts");
+    expect(folded.results).toEqual(["[sys] 42@postgres://app", "[sys] 42@mem"]);
+    const dynamic = runProject(transpileProject(withTest, { noStatic: true }).outputs, "main.ts");
+    expect(dynamic.results).toEqual(["[sys] 42@postgres://app", "[sys] 42@mem"]);
   });
 });
 

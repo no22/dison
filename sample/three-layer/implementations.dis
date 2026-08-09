@@ -1,0 +1,30 @@
+// Layer 2 — implementations. They know the contracts, but nothing about
+// which one the application will actually use.
+
+import type { Repository, Clock } from "./contracts";
+
+export class PostgresRepository implements Repository {
+  constructor(private readonly url: string) {}
+  find(id: string): string {
+    return `${id} from postgres(${this.url})`;
+  }
+}
+
+export class InMemoryRepository implements Repository {
+  find(id: string): string {
+    return `${id} from memory`;
+  }
+}
+
+export class SystemClock implements Clock {
+  now(): string {
+    return new Date().toISOString();
+  }
+}
+
+export class FrozenClock implements Clock {
+  constructor(private readonly at: string) {}
+  now(): string {
+    return this.at;
+  }
+}

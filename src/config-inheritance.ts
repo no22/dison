@@ -1,0 +1,245 @@
+// =====================================================================
+// configuration の継承（extends）の解決と平坦化
+// =====================================================================
+//
+// docs/configuration-inheritance.md の実装。`configuration [Name] extends A, B { ... }`
+// の継承元を解決し、実効エントリ列へ平坦化する。
+//
+//   flatten(C) = [...flatten(P1), ...flatten(P2), ..., ...own(C)]
+//
+// 同一キーは後勝ち。これで「子が親に勝つ」「右の親が左の親に勝つ」が両方得られ、
+// 既存の登録順（seq）規則とも一致する。
+//
+// 平坦化されたエントリは「由来（宣言元 configuration 名）」と「宣言元ファイル」を
+// 伴う。由来は兄弟衝突の検出に、宣言元ファイルは静的解決の factory hoisting に使う。
+
+import type { ConfigEntry, Node } from "./ast.js";
+
+// override エントリのキー正規化に使う共通形（対象クラス正準 ID とプロパティの組）。
+export function overridePairKeys(className: string, entry: Extract<ConfigEntry, { kind: "override" }>): string[] {
+  return entry.assignments.map((a) => `override ${className} ${a.prop}`);
+}
+
+export type ConfigurationNode = Extract<Node, { kind: "configuration" }>;
+
+// 名前付き configuration の宣言（どのファイルのものか付き）。
+export interface ConfigDecl<F> {
+  node: ConfigurationNode;
+  file: F;
+}
+
+// 名前 → 宣言 のリゾルバ。単一ファイルモードはローカル宣言のみ、複数ファイル
+// モードはプロジェクト全体を解決する（呼び出し側が与える）。
+export type ConfigResolver<F> = (name: string, from: F) => ConfigDecl<F> | undefined;
+
+// 平坦化済みの1エントリ。
+export interface FlatEntry<F> {
+  entry: ConfigEntry;
+  // 式の字句的な所属ファイル（factory hoisting の home）。
+  file: F;
+  // このエントリを宣言した configuration 名（無名なら undefined）。兄弟衝突の判定に使う。
+  origin: string | undefined;
+}
+
+export interface ConfigDiagnostic {
+  message: string;
+}
+
+export interface FlattenResult<F> {
+  entries: FlatEntry<F>[];
+  diagnostics: ConfigDiagnostic[];
+}
+
+// キー正規化。bind は照合キー文字列、override は (対象クラス, プロパティ) の組。
+// 単一ファイル（keyExprFor ベース）と複数ファイル（canonKey ベース）で規則が違うため、
+// 呼び出し側から関数として受け取る（二重実装を避ける）。
+export interface KeyNormalizer<F> {
+  bindKey(entry: Extract<ConfigEntry, { kind: "bind" }>, file: F): string;
+  overrideKeys(entry: Extract<ConfigEntry, { kind: "override" }>, file: F): string[];
+}
+
+/**
+ * configuration を平坦化する。`extends` の循環と、兄弟（互いに継承関係にない親）が
+ * 同じキーを別々に束縛する衝突を診断として返す。
+ *
+ * 衝突判定は「由来（宣言元 configuration 名）」で行うため、菱形継承
+ * （C extends A, B で A/B がともに Base から継いだ束縛）は衝突にならない。
+ * 子自身が同じキーを上書きしていれば、その時点で曖昧さは解消するので衝突にしない。
+ */
+export function flattenConfiguration<F>(
+  node: ConfigurationNode,
+  file: F,
+  resolve: ConfigResolver<F>,
+  // 省略すると兄弟衝突の検出を行わない（解析器はエントリ列だけを必要とするため）。
+  keys?: KeyNormalizer<F>
+): FlattenResult<F> {
+  const diagnostics: ConfigDiagnostic[] = [];
+  const seenDiagnostics = new Set<string>();
+  const pushDiag = (message: string): void => {
+    if (seenDiagnostics.has(message)) return;
+    seenDiagnostics.add(message);
+    diagnostics.push({ message });
+  };
+
+  // 祖先関係の判定に使う「configuration 名 → その祖先集合」。
+  const ancestorsOf = new Map<string, Set<string>>();
+
+  const collectAncestors = (name: string, from: F, stack: string[]): Set<string> => {
+    const cached = ancestorsOf.get(name);
+    if (cached !== undefined) return cached;
+    const out = new Set<string>();
+    const decl = resolve(name, from);
+    if (decl !== undefined) {
+      for (const parent of decl.node.extendsNames ?? []) {
+        if (stack.includes(parent)) continue; // 循環は flatten 側で報告
+        out.add(parent);
+        for (const a of collectAncestors(parent, decl.file, [...stack, parent])) out.add(a);
+      }
+    }
+    ancestorsOf.set(name, out);
+    return out;
+  };
+
+  const isAncestor = (maybeAncestor: string, of: string, from: F): boolean =>
+    collectAncestors(of, from, [of]).has(maybeAncestor);
+
+  const out: FlatEntry<F>[] = [];
+  const visiting: string[] = [];
+
+  const walk = (n: ConfigurationNode, f: F, origin: string | undefined): void => {
+    for (const parentName of n.extendsNames ?? []) {
+      if (visiting.includes(parentName)) {
+        pushDiag(
+          `configuration "${parentName}" is part of an "extends" cycle (${[...visiting, parentName].join(" -> ")}).`
+        );
+        continue;
+      }
+      const decl = resolve(parentName, f);
+      if (decl === undefined) {
+        pushDiag(
+          `configuration "${parentName}" in the "extends" clause of ${
+            origin !== undefined ? `configuration "${origin}"` : "an anonymous configuration"
+          } could not be resolved. Declare it in this file, or pass the file that declares it to the CLI as well.`
+        );
+        continue;
+      }
+      visiting.push(parentName);
+      walk(decl.node, decl.file, parentName);
+      visiting.pop();
+    }
+    for (const entry of n.entries) out.push({ entry, file: f, origin });
+  };
+
+  walk(node, file, node.name);
+
+  // --- 兄弟衝突の検出 ---
+  // 同一キーに複数の由来があり、どれも互いに祖先関係になく、かつ子自身
+  // （= 最後の由来である node 自身のエントリ）が上書きしていない場合はエラー。
+  const byKey = new Map<string, FlatEntry<F>[]>();
+  if (keys === undefined) return { entries: out, diagnostics };
+  for (const fe of out) {
+    const ks =
+      fe.entry.kind === "bind"
+        ? [keys.bindKey(fe.entry, fe.file)]
+        : keys.overrideKeys(fe.entry, fe.file);
+    for (const k of ks) {
+      let arr = byKey.get(k);
+      if (arr === undefined) {
+        arr = [];
+        byKey.set(k, arr);
+      }
+      arr.push(fe);
+    }
+  }
+
+  const selfOrigin = node.name;
+  for (const [, group] of byKey) {
+    if (group.length < 2) continue;
+    // 自分自身（展開先の configuration）が同じキーを持っていれば、そこで曖昧さは解消。
+    const resolvedBySelf = group.some((g) => g.origin === selfOrigin);
+    if (resolvedBySelf) continue;
+    const origins = [...new Set(group.map((g) => g.origin).filter((o): o is string => o !== undefined))];
+    if (origins.length < 2) continue; // 同じ由来（菱形の共通祖先など）→ 衝突ではない
+    // 互いに祖先関係にある組は「子が親を上書き」なので衝突ではない。
+    for (let i = 0; i < origins.length; i++) {
+      for (let j = i + 1; j < origins.length; j++) {
+        const a = origins[i];
+        const b = origins[j];
+        if (isAncestor(a, b, file) || isAncestor(b, a, file)) continue;
+        const label = group[0].entry.kind === "bind"
+          ? `bind "${(group[0].entry as Extract<ConfigEntry, { kind: "bind" }>).originalTypeName}"`
+          : `override "${(group[0].entry as Extract<ConfigEntry, { kind: "override" }>).className}"`;
+        pushDiag(
+          `configurations "${a}" and "${b}" both wire ${label}, and neither extends the other. ` +
+            `${selfOrigin !== undefined ? `configuration "${selfOrigin}"` : "The extending configuration"} must wire it explicitly to say which one wins.`
+        );
+      }
+    }
+  }
+
+  return { entries: out, diagnostics };
+}
+
+/**
+ * ファイル内の名前付きグローバル configuration を名前で引ける Map にする。
+ */
+export function namedGlobalConfigurations(ast: Node[]): Map<string, ConfigurationNode> {
+  const out = new Map<string, ConfigurationNode>();
+  for (const node of ast) {
+    if (node.kind === "configuration" && node.scope === "global" && node.name !== undefined) {
+      out.set(node.name, node);
+    }
+  }
+  return out;
+}
+
+/**
+ * 「フレーム形の applier（__dison_config_X）を emit すべき configuration 名」を求める。
+ * ローカル/クラススコープへの展開（`configuration extends X {}` が関数本体やクラス本体に
+ * 書かれた場合）だけが applier を必要とする。グローバルへの展開は activateX() 呼び出しで
+ * 足りる（docs/configuration-inheritance.md §3.2）。
+ *
+ * 継承は推移するため、applier が要る configuration の祖先にも applier が要る。
+ */
+export function configurationsNeedingApplier(
+  ast: Node[],
+  resolveLocal: (name: string) => ConfigurationNode | undefined
+): Set<string> {
+  const needed = new Set<string>();
+  const addWithAncestors = (name: string, stack: string[]): void => {
+    if (needed.has(name) || stack.includes(name)) return;
+    needed.add(name);
+    const decl = resolveLocal(name);
+    for (const parent of decl?.extendsNames ?? []) addWithAncestors(parent, [...stack, name]);
+  };
+  for (const node of ast) {
+    if (node.kind !== "configuration") continue;
+    if (node.scope === "global") continue; // グローバル展開は activateX() で足りる
+    for (const name of node.extendsNames ?? []) addWithAncestors(name, []);
+  }
+  return needed;
+}
+
+/**
+ * ファイル内の全 configuration について継承を平坦化し、循環・兄弟衝突の診断を集める。
+ * 呼び出し側（core.ts / CLI）がこれをエラーとして報告する。
+ */
+export function collectInheritanceDiagnostics<F>(
+  ast: Node[],
+  file: F,
+  resolve: ConfigResolver<F>,
+  keys: KeyNormalizer<F>
+): ConfigDiagnostic[] {
+  const out: ConfigDiagnostic[] = [];
+  const seen = new Set<string>();
+  for (const node of ast) {
+    if (node.kind !== "configuration") continue;
+    if (node.extendsNames === undefined) continue;
+    for (const d of flattenConfiguration(node, file, resolve, keys).diagnostics) {
+      if (seen.has(d.message)) continue;
+      seen.add(d.message);
+      out.push(d);
+    }
+  }
+  return out;
+}

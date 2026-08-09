@@ -10,7 +10,7 @@ import {
   collectConfigurationNames,
   collectImportedConfigurationNames,
   collectBlockContext,
-  isRiskyInjectableType,
+  isUnconstructibleShape,
   parseStringLiteralValue,
 } from "./analysis.js";
 
@@ -93,6 +93,29 @@ export class Parser {
         continue;
       }
 
+      // "export configuration Name { ... }": 名前付きグローバル configuration は
+      // 生成側が常に export するため（activateName / applier を他ファイルから
+      // 参照できるようにする）、ソースに書かれた export はここで吸収する。
+      // そのまま raw で通すと "export export function ..." になってしまう。
+      if (t.type === "ident" && t.text === "export" && this.peekSignificant(1).type === "keyword" &&
+          this.peekSignificant(1).text === "configuration") {
+        const save = this.pos;
+        this.next(); // 'export'
+        this.skipTrivia();
+        if (this.looksLikeConfiguration()) {
+          const node = this.parseConfiguration();
+          if (node.kind === "configuration" && node.name === undefined) {
+            throw new DisonParseError(
+              `"export" cannot be applied to an anonymous configuration (it is auto-active for the scope it is written in, and has nothing to export)`,
+              t.pos
+            );
+          }
+          nodes.push(node);
+          continue;
+        }
+        this.pos = save; // configuration 宣言ではなかった → raw へ戻す
+      }
+
       if (t.type === "keyword" && t.text === "injectable" && this.looksLikeInjectable()) {
         nodes.push(this.parseInjectable());
         continue;
@@ -151,12 +174,24 @@ export class Parser {
   // この判定に失敗し、通常の raw トークンとして扱われる
   // （looksLikeInjectable/looksLikeActivateと同じパターン）。
   private looksLikeConfiguration(): boolean {
-    const a = this.peekSignificant(1);
-    // 名前付き "configuration IDENT {" または無名 "configuration {"
-    // （無名は auto-active。docs/scoped-configuration.md）。
-    if (a.type === "punct" && a.text === "{") return true;
-    const b = this.peekSignificant(2);
-    return a.type === "ident" && b.type === "punct" && b.text === "{";
+    // 受理する形（docs/configuration-inheritance.md §1）:
+    //   configuration {                       無名
+    //   configuration IDENT {                 名前付き
+    //   configuration extends A, B {          無名＋継承（その位置への展開）
+    //   configuration IDENT extends A, B {    名前付き＋継承
+    // "configuration" の後に ident と "," だけが並び、最初の "{" に到達すれば
+    // configuration 宣言とみなす。それ以外の記号（"=", "?", "." 等）が現れたら、
+    // 単に "configuration" という名前の変数・メソッドが使われているだけと判断して
+    // raw パススルーに落とす。
+    const MAX_LOOKAHEAD = 32;
+    for (let i = 1; i <= MAX_LOOKAHEAD; i++) {
+      const t = this.peekSignificant(i);
+      if (t.type === "punct" && t.text === "{") return true;
+      if (t.type === "ident") continue;
+      if (t.type === "punct" && t.text === ",") continue;
+      return false;
+    }
+    return false;
   }
 
   // "token IDENT ;" の形になっているかを先読みで確認する。
@@ -259,11 +294,11 @@ export class Parser {
     // 危険な型（new で自動生成できない型）には既定初期化式が構文的に必須。
     // 安全な型（通常のクラス型）は省略可（従来通り new Type() が自動生成される）。
     // 判定には正規化済みキー（typeKey）を使う（空白・コメントの影響を受けない）。
-    if (defaultExpr === undefined && isRiskyInjectableType(typeKey, this.typeKinds)) {
+    if (defaultExpr === undefined && isUnconstructibleShape(typeKey)) {
+      // 配列・ユニオン・関数型など、bind に参加できない形。既定初期化式は必須のまま
+      // （docs/injectable-default-relaxation.md §1.3）。
       throw new DisonParseError(
-        `injectable "${propTok.text}" has type "${typeName}", which cannot be auto-constructed` +
-          ` (interface / type alias / abstract class, or an array/union/function type, etc.).` +
-          ` A default initializer "= <expr>" is required. Example: injectable ${propTok.text}: ${typeName} = new ConcreteClass();`,
+        `injectable "${propTok.text}" has type "${typeName}", which cannot be created automatically with "new" and cannot be resolved by "bind" either. Add a default initializer: injectable ${propTok.text}: ${typeName} = <expression>;`,
         propTok.pos
       );
     }
@@ -527,11 +562,53 @@ export class Parser {
 
     const startTok = this.next(); // 'configuration'
     this.skipTrivia();
-    // 名前は任意。無名（次が "{"）なら auto-active。
+    // 名前は任意。無名（次が "{" または "extends"）なら auto-active。
+    // "extends" は文脈依存キーワード扱いなので、configuration 名としては使えない
+    // （docs/configuration-inheritance.md §1.1）。
     let name: string | undefined;
-    if (this.peek().type === "ident") {
+    if (this.peek().type === "ident" && this.peek().text !== "extends") {
       name = this.next().text;
       this.skipTrivia();
+    }
+
+    // "extends A, B" 節（任意）。名前で参照した configuration のエントリを取り込む。
+    let extendsNames: string[] | undefined;
+    if (this.peek().type === "ident" && this.peek().text === "extends") {
+      const extendsTok = this.next(); // 'extends'
+      this.skipTrivia();
+      const names: string[] = [];
+      while (true) {
+        const t = this.peek();
+        if (t.type !== "ident") {
+          throw new DisonParseError(
+            `Expected a configuration name after "extends" but found "${t.text}"`,
+            t.pos
+          );
+        }
+        names.push(this.next().text);
+        this.skipTrivia();
+        const sep = this.peek();
+        if (sep.type === "punct" && sep.text === ",") {
+          this.next();
+          this.skipTrivia();
+          continue;
+        }
+        break;
+      }
+      const dup = names.find((n, i) => names.indexOf(n) !== i);
+      if (dup !== undefined) {
+        throw new DisonParseError(`configuration "${dup}" is listed twice in the same "extends" clause`, extendsTok.pos);
+      }
+      for (const n of names) {
+        if (n === name) {
+          throw new DisonParseError(`configuration "${n}" cannot extend itself`, extendsTok.pos);
+        }
+        // 名前の実在チェックはここでは行わない。単一ファイルモードは core.ts、
+        // 複数ファイルモードは CLI がプロジェクト全体で検証する（他ファイルの
+        // configuration は import 不要で参照でき、必要な import は生成側が注入する。
+        // docs/configuration-inheritance.md §3.2）。
+      }
+      extendsNames = names;
     }
     // フェーズ1/2: 名前付きローカル/クラス configuration（+ その activate）は未対応。
     if (scope !== "global" && name !== undefined) {
@@ -570,7 +647,7 @@ export class Parser {
       );
     }
 
-    return { kind: "configuration", name, scope, asyncScope, entries, tokenPos: configPos };
+    return { kind: "configuration", name, extendsNames, scope, asyncScope, entries, tokenPos: configPos };
   }
 
   // context: エラーメッセージに埋め込む文脈の説明。configuration内で呼ばれる
