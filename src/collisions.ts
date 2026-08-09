@@ -529,6 +529,17 @@ export function computeConfigExtendsPlanByFile(files: DisonFileInput[]): Map<str
   const result = new Map<string, ConfigExtendsPlan>();
   for (const p of pre) result.set(p.file.path, { applierEmit: new Set(), extendsImports: new Map() });
 
+  // `activate X from "./p"` が指定した specifier（脱糖後は configuration の extendsFrom）。
+  const explicitFrom = new Map<string, string>();
+  for (const p of pre) {
+    for (const n of p.ast) {
+      if (n.kind !== "configuration") continue;
+      for (const [name, spec] of Object.entries((n as any).extendsFrom ?? {})) {
+        explicitFrom.set(`${p.norm}::${name}`, spec as string);
+      }
+    }
+  }
+
   // 参照を辿り、必要な applier / import を積む。継承は推移するので親も辿る。
   const need = (name: string, from: Pre, asApplier: boolean, stack: string[]): void => {
     if (stack.includes(name)) return;
@@ -536,7 +547,10 @@ export function computeConfigExtendsPlanByFile(files: DisonFileInput[]): Map<str
     if (decl === undefined) return;
     if (asApplier) result.get(decl.file.path)!.applierEmit.add(name);
     if (decl.norm !== from.norm) {
-      const rel = relativeSpecifier(from.file.path, decl.norm);
+      // `activate X from "./p"` 由来の specifier があればそれを優先する
+      // （利用者が明示したパス。docs/activate-sugar-implementation.md §2.1）。
+      const explicit = explicitFrom.get(`${from.norm}::${name}`);
+      const rel = explicit ?? relativeSpecifier(from.file.path, decl.norm);
       const plan = result.get(from.file.path)!;
       const existing = plan.extendsImports.get(name);
       plan.extendsImports.set(name, {

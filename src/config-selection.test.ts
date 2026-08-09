@@ -145,37 +145,42 @@ configuration extends (isTest ? Test : Production) {}
   });
 });
 
-describe("3.0 への移行警告（非トップレベルの activate）", () => {
-  const PROGRAM = `${CONFIGS}
-activate Test;
-export function enable(): void { activate Test; }
-`;
-
-  it("ブロック内の activate に警告が出る", () => {
-    const warnings: string[] = [];
-    transpileDisonToTS(PROGRAM, { onWarning: (m) => warnings.push(m) });
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain('"activate Test" is inside a block');
-    expect(warnings[0]).toContain("configuration extends Test {}");
+describe("3.0: 非トップレベルの activate は移行エラー", () => {
+  it("関数の中の activate はエラーになり、書き換え先を示す", () => {
+    let err: Error | undefined;
+    try {
+      transpileDisonToTS(`${CONFIGS}\nexport function enable(): void { activate Test; }`);
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err?.message).toContain("is inside a block");
+    expect(err?.message).toContain("configuration extends Test {}");
+    expect(err?.message).toContain("configuration extends (cond ? Test : Other) {}");
   });
 
-  it("トップレベルの activate には警告が出ない", () => {
-    const warnings: string[] = [];
-    transpileDisonToTS(`${CONFIGS}\nactivate Test;`, { onWarning: (m) => warnings.push(m) });
-    expect(warnings).toEqual([]);
+  it("条件分岐の中の activate もエラーになる", () => {
+    expect(() =>
+      transpileDisonToTS(`${CONFIGS}\nif (true) { activate Test; }`)
+    ).toThrow(/is inside a block/);
   });
 
-  it("onWarning を渡さなければ何も起きない（非破壊）", () => {
-    expect(() => transpileDisonToTS(PROGRAM)).not.toThrow();
-  });
-
-  it("警告を出しても挙動は変わらない（2.3 では非破壊）", () => {
+  it("トップレベルの activate は従来どおり動く", () => {
     const mod = runGenerated(`${CONFIGS}
-export function enable(): void { activate Test; }
-enable();
+console.log("barrier");
+activate Test;
 export const results = [new Service().repo.tag()];
 `);
-    // 2.3 時点ではブロック内 activate はグローバルに効いたまま。
     expect(mod.results).toEqual(["mock"]);
+  });
+
+  it("クラス本体の activate はクラススコープになる（3.0 で解禁）", () => {
+    const mod = runGenerated(`${CONFIGS}
+class Scoped {
+  injectable repo: Repo;
+  activate Test;
+}
+export const results = [new Scoped().repo.tag(), new Service().repo.tag()];
+`);
+    expect(mod.results).toEqual(["mock", "default"]);
   });
 });

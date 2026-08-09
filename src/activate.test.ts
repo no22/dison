@@ -7,7 +7,9 @@ describe("activate", () => {
 configuration Cfg {}
 activate Cfg;
 `);
-    expect(out).toContain("activateCfg();");
+    // 3.0: activate は「その位置への展開」。登録を読む者がいなければ呼び出しごと消える。
+    // 動的残余があるケースは下のテストで確認する。
+    expect(out).toContain("export function activateCfg()");
   });
 
   it("未定義のconfiguration名を参照するとパースエラーになる", () => {
@@ -16,18 +18,26 @@ activate Cfg;
 });
 
 describe("activate ... from 'パス'（複数ファイル対応フェーズ2）", () => {
-  it("activateをクラス本体の直下に書くとパースエラーになる（from の有無を問わず）", () => {
-    expect(() =>
-      transpileDisonToTS(`configuration Cfg {}\nclass Foo {\n  bar() {}\n  activate Cfg;\n}`)
-    ).toThrow(/cannot be placed directly inside a class body/);
-    expect(() =>
-      transpileDisonToTS(`class Foo {\n  bar() {}\n  activate Cfg from "./configs";\n}`)
-    ).toThrow(/cannot be placed directly inside a class body/);
+  it("activateはクラス本体の直下に書ける（3.0: クラススコープになる）", () => {
+    const out = transpileDisonToTS(`
+class Repo { tag() { return "pg"; } }
+class MockRepo extends Repo { tag() { return "mock"; } }
+configuration Cfg { bind Repo = MockRepo; }
+class Foo {
+  injectable repo: Repo;
+  activate Cfg;
+}
+class Other { injectable repo: Repo; }
+`);
+    // クラススコープとして畳まれ、他クラスは影響を受けない。
+    expect(out).toContain("this._repo = new MockRepo();");
+    expect(out).toContain("this._repo = new Repo();");
   });
 
-  it("メソッドの中のactivateは引き続き有効（回帰確認）", () => {
-    const out = transpileDisonToTS(`configuration Cfg {}\nclass Foo {\n  bar() { activate Cfg; }\n}`);
-    expect(out).toContain("bar() { activateCfg(); }");
+  it("メソッドの中のactivateは3.0で移行エラーになる", () => {
+    expect(() =>
+      transpileDisonToTS(`configuration Cfg {}\nclass Foo {\n  bar() { activate Cfg; }\n}`)
+    ).toThrow(/is inside a block/);
   });
 
   it("from句があると、同一ファイル内の定義確認をスキップし、import文とその場の呼び出し文を生成する", () => {
@@ -36,13 +46,10 @@ describe("activate ... from 'パス'（複数ファイル対応フェーズ2）"
     expect(out).toContain("activateTestConfig();");
   });
 
-  it("関数の中でfromを使っても、importはファイル先頭に巻き上げられ、呼び出しだけがその場に残る", () => {
-    const out = transpileDisonToTS(`function setup() {\n  activate TestConfig from "./configs";\n}`);
-    const importIdx = out.indexOf('import { activateTestConfig } from "./configs";');
-    const fnIdx = out.indexOf("function setup()");
-    expect(importIdx).toBeGreaterThan(-1);
-    expect(importIdx).toBeLessThan(fnIdx);
-    expect(out).toContain("function setup() {\n  activateTestConfig();\n}");
+  it("関数の中でfromを使うと3.0で移行エラーになる", () => {
+    expect(() =>
+      transpileDisonToTS(`function f() {\n  activate TestConfig from "./configs";\n}`)
+    ).toThrow(/is inside a block/);
   });
 
   it("同じ(名前, パス)の組は1つのimportにまとめられる", () => {

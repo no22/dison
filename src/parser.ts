@@ -399,16 +399,16 @@ export class Parser {
 
   private parseActivate(): Node {
     const startPos = this.pos; // 静的解決のフロー解析用（docs/static-resolution-design.md）
-    // activate はただの関数呼び出し文に脱糖されるため、injectable/configuration
-    // のような「宣言」と違い文が書ける場所ならどこでも良いが、クラス本体の
-    // 直下（メソッドの外）だけは代入文・呼び出し文を置ける位置ではないため
-    // 不可（単独override/bindと同じ制約）。
-    if (this.blockContext.isDirectClassBodyChild(this.pos)) {
-      throw new DisonParseError(
-        `"activate" cannot be placed directly inside a class body (put it inside a method, or at the top level / inside a function)`,
-        this.peek().pos
-      );
-    }
+    const startTok = this.peek();
+    // 3.0: activate は「その位置に configuration extends X {} が書かれたのと同じ」
+    // （docs/activate-as-sugar-v3.md）。スコープは構文位置で決まるので、クラス本体
+    // 直下も書けるようになった（クラススコープになる）。
+    // 意味が変わる位置（関数・条件分岐の中）は移行エラーにする（§2.2）。
+    const scope: "global" | "local" | "class" = this.blockContext.isTopLevel(this.pos)
+      ? "global"
+      : this.blockContext.isDirectClassBodyChild(this.pos)
+      ? "class"
+      : "local";
 
     this.next(); // 'activate'
     this.skipTrivia();
@@ -458,7 +458,32 @@ export class Parser {
       );
     }
 
-    return { kind: "activate", name: nameTok.text, fromPath, tokenPos: startPos };
+    if (scope === "local") {
+      throw new DisonParseError(
+        `"activate ${nameTok.text}" is inside a block. Since Dison 3.0, activate means ` +
+          `"splice this configuration here", so its scope follows where it is written — ` +
+          `this one would be undone at the end of the block. ` +
+          `If that is what you want, write it explicitly: configuration extends ${nameTok.text} {}. ` +
+          `If you wanted to switch the wiring for the whole program, move it to the top level, ` +
+          `or select at runtime: configuration extends (cond ? ${nameTok.text} : Other) {}`,
+        startTok.pos
+      );
+    }
+
+    // configuration ノードへ脱糖する。2.1 で extends を全スコープに実装済みなので、
+    // 下流（解析・codegen・applier 計画・被覆チェック）は一切変更を要しない。
+    // このファイルに定義が無く import 経由で知っている名前は、中身が見えなくて正常。
+    const externallyProvided =
+      fromPath === undefined && !collectConfigurationNames(this.tokens).has(nameTok.text);
+    return {
+      kind: "configuration",
+      extendsNames: [nameTok.text],
+      extendsFrom: fromPath !== undefined ? { [nameTok.text]: fromPath } : undefined,
+      extendsExternal: externallyProvided ? [nameTok.text] : undefined,
+      scope,
+      entries: [],
+      tokenPos: startPos,
+    };
   }
 
   // 型注釈を "次のトップレベル ; または =（既定初期化式の開始）まで" 丸ごと

@@ -66,6 +66,13 @@ export type Node =
       name?: string;
       extendsNames?: string[];
       extendsSelections?: { leaves: string[]; exprTemplate: string }[];
+      // extendsFrom: `activate X from "./p";` 由来の specifier（名前 → パス）。
+      // プロジェクト全体の名前解決より優先される（単一ファイルモードでの
+      // クロスファイル参照手段。docs/activate-sugar-implementation.md §2.1）。
+      extendsFrom?: Record<string, string>;
+      // extendsExternal: 宣言がこのファイルから見えないことが正常な名前
+      // （`import { activateX }` 経由で知っている configuration）。未解決を診断しない。
+      extendsExternal?: string[];
       scope: "global" | "local" | "class";
       asyncScope?: boolean;
       entries: ConfigEntry[];

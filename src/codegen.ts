@@ -140,8 +140,16 @@ function generateConfiguration(
   strategy: KeyStrategy,
   scopeId: number,
   wiring: WiringTable | undefined,
-  applierEmit: Set<string>
+  applierEmit: Set<string>,
+  fromBindings: Map<string, FromActivateBinding>
 ): string {
+  // `activate X from "./p"` 由来の名前は、同名を別パスから取り込む場合に備えて
+  // エイリアスで呼ぶ（docs/activate-from-syntax.md）。
+  const callName = (name: string): string => {
+    const path = node.extendsFrom?.[name];
+    if (path === undefined) return `activate${name}`;
+    return fromBindings.get(`${name}::${path}`)?.alias ?? `activate${name}`;
+  };
   // 静的解決で「登録を読む者がいない」と証明された場合、グローバル configuration の
   // 登録文は出力しない（ランタイム前置きごと消えるため、残すとコンパイルも通らない）。
   // dropRegistrations が真になるのは local/class スコープが存在しないファイルだけ
@@ -162,7 +170,12 @@ function generateConfiguration(
     }
     // 無名グローバル / クラススコープ: 配線は畳んだゲッターに焼き込まれており、
     // フレームを読む者はいない（L1.5）。static フィールドごと出力しない。
-    return "";
+    //
+    // ただし `activate X from "./p"` 由来の呼び出しだけは残す。参照先は**別モジュール**の
+    // レジストリなので、「読む者がいない」ことをこちらで証明できない（自ファイルの
+    // 登録を消す dead registration elimination の根拠が及ばない）。
+    const fromCalls = Object.keys(node.extendsFrom ?? {}).map((name) => `${callName(name)}();`);
+    return fromCalls.join("\n");
   }
   // local と class は「フレームへ差分を積む」形（__disonBind/__disonOverride）を共有する。
   // 名前付きグローバルでも applier を emit する場合はフレーム形になる。
@@ -177,7 +190,7 @@ function generateConfiguration(
     lines.push(
       frameForm
         ? `  ${configApplierName(parent)}(__disonBind, __disonOverride);`
-        : `  activate${parent}();`
+        : `  ${callName(parent)}();`
     );
   }
   // 実行時選択（docs/activate-sugar-implementation.md §1.3）: applier を値として選ぶ。
@@ -340,19 +353,21 @@ export function resolveFromActivateBindings(nodes: Node[]): Map<string, FromActi
   const aliasOwner = new Map<string, string>(); // alias -> それを最初に使ったpath
 
   for (const node of nodes) {
-    if (node.kind !== "activate" || node.fromPath === undefined) continue;
-    const key = `${node.name}::${node.fromPath}`;
+    if (node.kind !== "configuration") continue;
+    for (const [name, fromPath] of Object.entries(node.extendsFrom ?? {})) {
+    const key = `${name}::${fromPath}`;
     if (byKey.has(key)) continue;
 
-    const exportedName = `activate${node.name}`;
+    const exportedName = `activate${name}`;
     let alias = exportedName;
     let suffix = 2;
-    while (aliasOwner.has(alias) && aliasOwner.get(alias) !== node.fromPath) {
+    while (aliasOwner.has(alias) && aliasOwner.get(alias) !== fromPath) {
       alias = `${exportedName}_${suffix}`;
       suffix++;
     }
-    aliasOwner.set(alias, node.fromPath);
-    byKey.set(key, { exportedName, alias, path: node.fromPath });
+    aliasOwner.set(alias, fromPath);
+    byKey.set(key, { exportedName, alias, path: fromPath });
+    }
   }
 
   return byKey;
@@ -459,7 +474,8 @@ export function generate(
           strategy,
           node.scope === "local" || node.scope === "class" ? scopeCounter++ : -1,
           wiring,
-          applierEmit
+          applierEmit,
+          fromBindings
         );
         break;
       case "injectable":

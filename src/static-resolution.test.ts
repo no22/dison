@@ -65,9 +65,10 @@ class MockRepo extends Repo {}
 class S { injectable repo: Repo; }
 `);
     expect(out).toContain("this._repo = new MockRepo();");
-    // activate 呼び出しの形は維持しつつ、中身は空になる。
+    // 3.0: activate は「その位置への展開」なので、登録を読む者がいなければ
+    // 呼び出しごと消える（空関数の呼び出しという死んだコードを残さない）。
     expect(out).toContain("export function activateCfg() {\n}");
-    expect(out).toContain("activateCfg();");
+    expect(out).not.toContain("activateCfg();");
     expect(out).not.toContain("bindTypeLazy");
   });
 
@@ -181,16 +182,17 @@ class S {
     expect(out).not.toContain("DI_REGISTRY");
   });
 
-  it("関数内のactivateがある名前付きconfigurationの配線は畳まれない", () => {
+  it("関数内へ展開された configuration の配線は畳まれない（ローカルスコープ）", () => {
+    // 3.0: 関数内の activate は移行エラー。同じ意図は明示形で書く。
     const out = transpileDisonToTS(`
 configuration Cfg { bind Repo = MockRepo; }
 class Repo {}
 class MockRepo extends Repo {}
 class S { injectable repo: Repo; }
-function enable() { activate Cfg; }
+function enable() { configuration extends Cfg {} }
 `);
     expect(out).toContain("__disonResolveInjectable");
-    expect(out).toContain("bindTypeLazy");
+    expect(out).toContain("__disonEnterScopeLazy");
   });
 
   it("サブクラスを対象にしたoverrideは、そのサブクラスにゲッターを再宣言して畳む", () => {

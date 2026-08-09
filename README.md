@@ -115,12 +115,12 @@ initializer.
 
 ### `configuration` / `activate`
 
-Groups a set of `override`/`bind` statements. A **named** configuration
-is activated explicitly with `activate`, which always applies to the global
-scope. Local and class scopes are written as anonymous configurations
-(see [Scoped configuration](#scoped-configuration-new-in-120)) — and since
-2.1 they can pull in a named configuration's wiring with
-[`extends`](#placing-a-configuration-anonymous-extends-new-in-21):
+Groups a set of `override`/`bind` statements. A **named** configuration is
+reusable wiring; where you *place* it decides how far it reaches. Writing
+`activate X;` is the short way to place one — since 3.0 it means exactly
+`configuration extends X {}`, so the usual
+[scope rules](#scoped-configuration-new-in-120) apply to it like anything
+else:
 
 ```dison
 configuration TestConfig {
@@ -206,22 +206,31 @@ In a multi-file project you don't import the configuration: Dison resolves
 the name across the project and injects whatever import the generated code
 needs, the same way it handles companion symbols.
 
-`activate` keeps its own meaning — an explicit, *dynamic* switch that applies
-to the global scope wherever it runs, including inside functions and
-conditionals. Reach for `configuration extends` when you want declarative,
-lexical wiring (it also folds statically); reach for `activate` when you
-genuinely want to decide at runtime.
+`activate X;` is sugar for `configuration extends X {}` (new in 3.0), so the
+two are interchangeable and there is only one rule to remember: **naming
+carries reuse, position carries scope.**
 
-> **Changing in 3.0.** `activate X;` will become sugar for
-> `configuration extends X {}`, so its scope will follow *where it is
-> written* like every other configuration. At the top level nothing changes.
-> Inside a function or a conditional it would change meaning, so 3.0 makes
-> those a build error that points at the replacement — write
-> `configuration extends X {}` for the block-scoped meaning, or select at
-> runtime with `configuration extends (cond ? X : Y) {}` if you wanted the
-> whole program rewired. 2.3 warns about those positions today; the
-> transpiler prints them, and `transpileDisonToTS` reports them through the
-> new `onWarning` option.
+```dison
+activate Production;                      // top level → global
+class Service { activate CachingWiring; } // class body → class scope (new in 3.0)
+```
+
+> **Changed in 3.0 — migration.** Before 3.0, `activate` was a dynamic
+> switch that always mutated the global registry, wherever it ran. At the
+> top level nothing changes. Inside a function or a conditional it would now
+> mean a block-scoped configuration that is undone at the end of the block,
+> so rather than change quietly, **3.0 rejects it with a build error** that
+> names the replacement:
+>
+> - block-scoped is what you wanted → `configuration extends X {}`
+> - the whole program should be rewired → move it to the top level, or
+>   `configuration extends (cond ? X : Y) {}`
+>   ([runtime selection](#selecting-a-configuration-at-runtime-new-in-23),
+>   available since 2.3)
+>
+> Because every position whose meaning changed is an error, **a program that
+> compiles under 3.0 behaves exactly as it did under 2.x.** 2.3 warns about
+> the same positions if you want to migrate before upgrading.
 
 #### Forward references (new in 1.5.0)
 
@@ -296,13 +305,11 @@ generator instead.
 > code that uses them needs `Symbol.dispose` (TypeScript 5.2+ / Node 20+)
 > and `node:async_hooks` at runtime. See [Requirements](#requirements).
 
-*(Only anonymous configurations can be written in a local or class scope,
-and they are auto-active there. Naming a configuration and activating it by
-name stays global-scope-only, by design: the dynamic, explicit-activation
-model that `activate` provides doesn't fit scopes that are already tied
-lexically to a block or class. Reuse across scopes is served instead by
-[`configuration extends`](#placing-a-configuration-anonymous-extends-new-in-21),
-which keeps naming for reuse and position for scope.)*
+*(Only anonymous configurations can be **declared** in a local or class
+scope, and they are auto-active there. A named configuration is always
+declared at the top level and then placed where you need it, with
+`activate X;` or the equivalent
+[`configuration extends X {}`](#placing-a-configuration-anonymous-extends-new-in-21).)*
 
 ### `override`
 
@@ -487,9 +494,8 @@ Handler.db         → runtime lookup             [dynamic: bound in a local sco
 Lines indented under another are subclasses whose wiring diverges from their
 parent's; they get their own generated getter.
 
-Dynamic wiring keeps its exact 1.x behavior: `activate` calls that run
-after a key was already used (or inside functions/conditionals), local
-scopes, wiring on a subclass that diverges from its parent, and
+Dynamic wiring keeps its exact 1.x behavior: wiring that runs after a key
+was already used, configurations selected at runtime, local scopes, and
 anything the analysis cannot prove. Static and dynamic keys coexist in
 one file — each getter independently gets the cheapest form that
 preserves behavior. `dison --no-static` disables folding and restores
@@ -521,8 +527,8 @@ what it actually needs depends on how much of your wiring is static:
   and `node:async_hooks`. Your `tsconfig.json` needs a `lib` that
   includes `Symbol.dispose` (e.g. `"lib": ["esnext"]`) and
   `@types/node`.
-- **Other dynamic wiring** (late or conditional `activate`, diverging
-  subclass wiring, ...) keeps the inlined registry in single-file
+- **Other dynamic wiring** (wiring placed after a key is already used, a
+  configuration selected at runtime, ...) keeps the inlined registry in single-file
   output — without local scopes it uses a synchronous stub instead of
   `node:async_hooks` (since 1.6.0), so it still runs outside Node.
   Multi-file output with dynamic residue shares state through

@@ -134,6 +134,14 @@ export function flattenConfiguration<F>(
       }
       const decl = resolve(parentName, f);
       if (decl === undefined) {
+        // `activate X from "./p"` 由来（extendsFrom で specifier が明示されている）の
+        // 場合、その configuration の中身は意図的に読まない仕様なので未解決は正常
+        // （docs/activate-from-syntax.md／activate-sugar-implementation.md §2.1）。
+        // 生成側は import と呼び出しを出すだけで、エントリは見えないまま。
+        if (n.extendsFrom?.[parentName] !== undefined) continue;
+        // `import { activateX } from "..."` だけがある場合も、その configuration の
+        // 中身は見えないのが仕様（docs/multi-file-support.md）。未解決は正常。
+        if (n.extendsExternal?.includes(parentName) === true) continue;
         pushDiag(
           `configuration "${parentName}" in the "extends" clause of ${
             origin !== undefined ? `configuration "${origin}"` : "an anonymous configuration"
@@ -184,6 +192,10 @@ export function flattenConfiguration<F>(
         const a = origins[i];
         const b = origins[j];
         if (isAncestor(a, b, file) || isAncestor(b, a, file)) continue;
+        // 両方を継承する configuration が同じキーを書いていれば、そこで曖昧さは
+        // 解消済み（例: Both extends Left, Right { bind K = ... } を activate した場合、
+        // 展開元が無名でも Both が解決している）。
+        if (origins.some((o) => isAncestor(a, o, file) && isAncestor(b, o, file))) continue;
         const label = group[0].entry.kind === "bind"
           ? `bind "${(group[0].entry as Extract<ConfigEntry, { kind: "bind" }>).originalTypeName}"`
           : `override "${(group[0].entry as Extract<ConfigEntry, { kind: "override" }>).className}"`;

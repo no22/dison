@@ -470,10 +470,28 @@ export const results = [new ReportService().render("42")];
     expect(outputs.get("wiring.dis")!).toMatch(/export function __dison_factory_\d+\(\) \{ return \(new PgRepository\(DB_URL\)\); \}/);
   });
 
-  it("extends の import は生成側が注入する（利用者は書かない）", () => {
+  it("全畳みなら extends の呼び出しも import も残らない（死んだコードを出さない）", () => {
     const { outputs } = transpileProject(files);
     expect(files["main.dis"]).not.toContain('from "./wiring"');
+    // 配線は全てゲッターに焼き込まれているので、activate 呼び出しとその import は不要。
+    expect(outputs.get("main.dis")!).not.toContain('from "./wiring"');
+    expect(outputs.get("main.dis")!).not.toContain("activateProduction();");
+  });
+
+  it("動的残余があるときは extends の import を生成側が注入する（利用者は書かない）", () => {
+    const withDynamic = {
+      ...files,
+      "main.dis": `
+import { ReportService } from "./service";
+console.log("barrier:", new ReportService().render("0"));
+configuration extends Production {}
+export const results = [new ReportService().render("42")];
+`,
+    };
+    const { outputs } = transpileProject(withDynamic);
+    expect(withDynamic["main.dis"]).not.toContain('from "./wiring"');
     expect(outputs.get("main.dis")!).toContain('import { activateProduction } from "./wiring";');
+    expect(outputs.get("main.dis")!).toContain("activateProduction();");
   });
 
   it("実行結果は --no-static と一致する", () => {

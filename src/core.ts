@@ -310,8 +310,9 @@ export interface TranspileOptions {
   // activateX を import する。
   configExtendsImports?: Map<string, { specifier: string; needsApplier: boolean }>;
 
-  // 警告の受け取り口（docs/activate-sugar-implementation.md §1.6）。省略時は何もしない。
-  // 3.0 で意味が変わる書き方（非トップレベルの activate）を事前に知らせるために使う。
+  // 警告の受け取り口（2.3 で新設）。省略時は何もしない。2.3 では非トップレベルの
+  // activate への移行予告に使っていたが、3.0 でそれはパースエラーになったため
+  // 現在の産出者は無い。将来の非致命的な診断のために口だけ残してある。
   onWarning?: (message: string) => void;
 
   // 複数ファイルモードの静的解決（フェーズ2）。CLI が computeProjectWiring で
@@ -381,25 +382,6 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
     };
   }
 
-  // 移行警告（3.0 予告）: 非トップレベルの activate は 3.0 で「その位置への展開」に
-  // 意味が変わる（docs/activate-as-sugar-v3.md）。2.3 では挙動を変えず警告のみ。
-  if (options.onWarning !== undefined) {
-    const blockContextForWarn = collectBlockContext(tokens);
-    for (const node of ast) {
-      if (node.kind !== "activate") continue;
-      const pos = node.tokenPos ?? 0;
-      if (blockContextForWarn.isTopLevel(pos)) continue;
-      options.onWarning(
-        `"activate ${node.name}" is inside a block. Today it registers globally, but in Dison 3.0 ` +
-          `activate will mean "splice this configuration here", so its scope will follow where it is ` +
-          `written and this one would be undone at the end of the block. ` +
-          `Write "configuration extends ${node.name} {}" if you want the block-scoped meaning, ` +
-          `or move it to the top level / select at runtime with ` +
-          `"configuration extends (cond ? ${node.name} : Other) {}" if you want it to apply globally.`
-      );
-    }
-  }
-
   // configuration の継承（docs/configuration-inheritance.md）。ローカル/クラススコープへ
   // 展開される configuration は applier 形で emit する必要がある。
   const namedConfigs = namedGlobalConfigurations(ast);
@@ -409,6 +391,21 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   ]);
   const extendsImports =
     options.configExtendsImports ?? new Map<string, { specifier: string; needsApplier: boolean }>();
+
+  // `activate X from "./p"` 由来（脱糖後は configuration の extendsFrom）。単一ファイル
+  // モードでは他ファイルの configuration を見られないので、利用者が明示したパスから
+  // import を注入する（従来の activate-from と同じ振る舞い）。
+  for (const node of ast) {
+    if (node.kind !== "configuration") continue;
+    // グローバル位置の `from` は従来の from-import 機構（エイリアス付き）が
+    // activateX を import する。ここで扱うのはフレーム位置（クラススコープ）だけで、
+    // そちらは applier が要る。二重 import を避けるための役割分担。
+    if (node.scope === "global") continue;
+    for (const [name, spec] of Object.entries(node.extendsFrom ?? {})) {
+      if (extendsImports.has(name)) continue;
+      extendsImports.set(name, { specifier: spec, needsApplier: true });
+    }
+  }
 
   // 継承の循環・兄弟衝突の診断（docs/configuration-inheritance.md §2.2/§2.3）。
   // 複数ファイルモードでは CLI がプロジェクト全体で行うので、ここでは行わない
@@ -517,9 +514,21 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
   const pw = options.projectWiring;
   // extends が他ファイルの configuration を参照する場合の import
   // （docs/configuration-inheritance.md §3.2）。
+  // 登録が不要と証明された場合、extends の呼び出しは出力されないので import も落とす
+  // （未使用 import を残さない）。ただし `from` 指定のものは呼び出しが残るので保持する。
+  const explicitFromNames = new Set<string>();
+  for (const node of ast) {
+    if (node.kind === "configuration") {
+      for (const name of Object.keys(node.extendsFrom ?? {})) explicitFromNames.add(name);
+    }
+  }
+  const keptExtendsImports =
+    wiring?.dropRegistrations === true
+      ? new Map([...extendsImports].filter(([name]) => explicitFromNames.has(name)))
+      : extendsImports;
   const extendsImportsStr =
-    extendsImports.size > 0
-      ? [...extendsImports]
+    keptExtendsImports.size > 0
+      ? [...keptExtendsImports]
           .map(
             ([name, info]) =>
               `import { ${info.needsApplier ? configApplierName(name) : `activate${name}`} } from ${JSON.stringify(info.specifier)};`
