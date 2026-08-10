@@ -13,7 +13,7 @@
 // 平坦化されたエントリは「由来（宣言元 configuration 名）」と「宣言元ファイル」を
 // 伴う。由来は兄弟衝突の検出に、宣言元ファイルは静的解決の factory hoisting に使う。
 
-import type { ConfigEntry, Node } from "./ast.js";
+import type { ConfigEntry, Node, ProvidesKey } from "./ast.js";
 
 // override エントリのキー正規化に使う共通形（対象クラス正準 ID とプロパティの組）。
 export function overridePairKeys(className: string, entry: Extract<ConfigEntry, { kind: "override" }>): string[] {
@@ -274,6 +274,94 @@ export function collectInheritanceDiagnostics<F>(
       if (seen.has(d.message)) continue;
       seen.add(d.message);
       out.push(d);
+    }
+  }
+  return out;
+}
+
+
+/**
+ * `provides` 節の検査（docs/configuration-provides.md）。
+ *
+ * 宣言された集合 ⊆ 実効エントリのキー集合、を検査する。実効エントリは平坦化済み
+ * （`extends` で継いだ分を含む）。実行時選択 `extends (cond ? A : B)` は
+ * **全葉の積集合**（どの葉が選ばれても提供される分だけ）を実効とみなす
+ * ——docs/activate-sugar-implementation.md §1.5 の被覆チェックと同一の規則。
+ *
+ * providesKeyOf: 宣言キーを正規化する関数（bind は keyExprFor/canonKey と同じ規則で、
+ * override は「対象クラス正準ID プロパティ」）。呼び出し側が単一ファイル用/プロジェクト
+ * 用のどちらかを渡す。
+ */
+export function findProvidesViolations<F>(
+  ast: Node[],
+  file: F,
+  resolve: ConfigResolver<F>,
+  keys: KeyNormalizer<F>,
+  providesKeyOf: (key: ProvidesKey, file: F) => string
+): ConfigDiagnostic[] {
+  const out: ConfigDiagnostic[] = [];
+  const seen = new Set<string>();
+  const push = (message: string): void => {
+    if (seen.has(message)) return;
+    seen.add(message);
+    out.push({ message });
+  };
+
+  // configuration の実効キー集合（平坦化済みエントリを正規化したもの）。
+  const effectiveKeysOf = (node: ConfigurationNode, f: F): Set<string> => {
+    const set = new Set<string>();
+    for (const fe of flattenConfiguration(node, f, resolve).entries) {
+      if (fe.entry.kind === "bind") set.add(keys.bindKey(fe.entry, fe.file));
+      else for (const k of keys.overrideKeys(fe.entry, fe.file)) set.add(k);
+    }
+    return set;
+  };
+
+  for (const node of ast) {
+    if (node.kind !== "configuration") continue;
+    const declared = node.providesKeys;
+    if (declared === undefined || declared.length === 0) continue;
+
+    const label =
+      node.name !== undefined ? `configuration "${node.name}"` : "this configuration";
+
+    // 静的な extends と自身のエントリ（選択形の葉は含めない）。
+    const staticKeys = effectiveKeysOf({ ...node, extendsSelections: undefined }, file);
+
+    // 選択形は葉ごとに実効集合を出し、積集合だけを保証とみなす。
+    // 葉ごとの内訳はエラーメッセージ（どの葉が欠けているか）に使う。
+    const leafSets: { leaf: string; keys: Set<string> }[] = [];
+    for (const sel of node.extendsSelections ?? []) {
+      for (const leaf of sel.leaves) {
+        const decl = resolve(leaf, file);
+        leafSets.push({ leaf, keys: decl === undefined ? new Set() : effectiveKeysOf(decl.node, decl.file) });
+      }
+    }
+
+    for (const key of declared) {
+      const norm = providesKeyOf(key, file);
+      const shown =
+        key.kind === "bind" ? key.typeName + (key.token !== undefined ? ` as ${key.token}` : "") : `${key.className}.${key.prop}`;
+      if (staticKeys.has(norm)) continue;
+
+      if (leafSets.length > 0) {
+        const missing = leafSets.filter((l) => !l.keys.has(norm));
+        if (missing.length === 0) continue; // 全葉が提供 → 積集合に入る
+        const rows = leafSets
+          .map((l) => `    ${l.leaf} ${l.keys.has(norm) ? "provides it" : "does NOT provide it"}`)
+          .join("\n");
+        push(
+          `${label} declares that it provides "${shown}", but the runtime selection can pick a ` +
+            `configuration that does not provide it:\n${rows}`
+        );
+        continue;
+      }
+
+      push(
+        `${label} declares that it provides "${shown}", but nothing in it (or in the ` +
+          `configurations it extends) wires that key. Add the wiring, or remove "${shown}" ` +
+          `from the "provides" clause.`
+      );
     }
   }
   return out;

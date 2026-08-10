@@ -160,6 +160,40 @@ same key, that is a build error rather than a silent coin flip — the child
 must wire it explicitly to say which one it wants. Cycles are a build error
 too.
 
+#### Declaring what a configuration provides (new in 3.1)
+
+A configuration can state the keys it is expected to wire:
+
+```dison
+configuration Production provides Repository, Clock {
+  bind Repository = PostgresRepository(DATABASE_URL);
+  bind Clock = SystemClock;
+}
+```
+
+It means "**at least** these" — you can wire anything else you like on top.
+If a listed key isn't wired (by this configuration or one it extends), the
+build fails **at the configuration that broke the promise**:
+
+```
+configuration "Production" declares that it provides "Clock", but nothing in
+it (or in the configurations it extends) wires that key.
+```
+
+This is worth having because of what happens without it. Drop a `bind` and,
+if the consuming `injectable` has a default initializer, the default quietly
+takes over — the program keeps compiling and silently changes behaviour. A
+`provides` clause turns that into a build error, and points at the file you
+just edited rather than at some distant `injectable`.
+
+Override targets can be listed too (`provides Service.repo`), and keys use
+exactly the same syntax as a `bind` left-hand side, so generics
+(`Repository<User>`) and `as <token>` work as usual.
+
+`provides` is opt-in: it is a compile-time assertion only, leaves no trace
+in the generated code, and configurations without it behave exactly as
+before.
+
 #### Selecting a configuration at runtime (new in 2.3)
 
 A parenthesised conditional picks between named configurations at runtime,
@@ -177,7 +211,15 @@ from. Only the *choice* is dynamic; the shape stays static, and scope still
 follows position, so this works in a class body or a function too.
 
 Keys that **every** branch binds still count as guaranteed, so an
-`injectable` of that type needs no default initializer.
+`injectable` of that type needs no default initializer. Add a
+[`provides`](#declaring-what-a-configuration-provides-new-in-31) clause to
+the selection and Dison will check the branches against it, naming the ones
+that fall short:
+
+```
+Test provides it
+Production does NOT provide it
+```
 
 #### Placing a configuration: anonymous `extends` (new in 2.1)
 

@@ -3,7 +3,7 @@
 // =====================================================================
 
 import type { Token } from "./lexer.js";
-import type { Node, OverrideEntry, BindEntry, ConfigEntry } from "./ast.js";
+import type { Node, OverrideEntry, BindEntry, ConfigEntry, ProvidesKey } from "./ast.js";
 import {
   type DeclaredTypeKinds,
   type BlockContext,
@@ -183,11 +183,16 @@ export class Parser {
     // configuration 宣言とみなす。それ以外の記号（"=", "?", "." 等）が現れたら、
     // 単に "configuration" という名前の変数・メソッドが使われているだけと判断して
     // raw パススルーに落とす。
-    // 実行時選択 "extends (条件木)" では括弧グループが挟まる
-    // （docs/activate-sugar-implementation.md §1.2）。括弧の中は任意の TS 式なので
-    // 深さを数えて丸ごと読み飛ばし、その外側では ident と "," だけを許す。
+    // 節の中に現れうるもの:
+    //   - "extends (条件木)" の括弧グループ（docs/activate-sugar-implementation.md §1.2）
+    //     → 中は任意の TS 式なので深さを数えて丸ごと読み飛ばす
+    //   - "provides Repository<User>" のジェネリクス（docs/configuration-provides.md）
+    //     → 山カッコも深さを数える
+    //   - "provides Service.repo" の "."、"provides X as Tok" の ident
+    // その外側で許すのは ident と ","、"." だけ。"{" に達したら configuration 宣言。
     const MAX_LOOKAHEAD = 512;
     let depth = 0;
+    let angle = 0;
     for (let i = 1; i <= MAX_LOOKAHEAD; i++) {
       const t = this.peekSignificant(i);
       if (t.type === "eof") return false;
@@ -201,9 +206,19 @@ export class Parser {
         continue;
       }
       if (depth > 0) continue; // 括弧の中は任意の式
+      if (t.type === "punct" && t.text === "<") {
+        angle++;
+        continue;
+      }
+      if (t.type === "punct" && t.text === ">") {
+        angle--;
+        if (angle < 0) return false;
+        continue;
+      }
+      if (angle > 0) continue; // 型引数の中
       if (t.type === "punct" && t.text === "{") return true;
       if (t.type === "ident") continue;
-      if (t.type === "punct" && t.text === ",") continue;
+      if (t.type === "punct" && (t.text === "," || t.text === ".")) continue;
       return false;
     }
     return false;
@@ -611,12 +626,30 @@ export class Parser {
       this.skipTrivia();
     }
 
-    // "extends A, B" 節（任意）。名前で参照した configuration のエントリを取り込む。
-    // 各項は「configuration 名」または「(条件木)」（実行時選択。
-    // docs/activate-sugar-implementation.md §1.2）。
+    // 修飾節（任意・順不同）: "extends A, B" と "provides K, ..."。
+    // どちらも configuration 名と "{" の間に置かれる独立した修飾なので、
+    // 順序を覚える理由が無い（docs/configuration-provides-implementation.md §1.1）。
     let extendsNames: string[] | undefined;
     let extendsSelections: { leaves: string[]; exprTemplate: string }[] | undefined;
-    if (this.peek().type === "ident" && this.peek().text === "extends") {
+    let providesKeys: ProvidesKey[] | undefined;
+    let sawExtends = false;
+    let sawProvides = false;
+    while (this.peek().type === "ident" && (this.peek().text === "extends" || this.peek().text === "provides")) {
+    if (this.peek().text === "provides") {
+      const providesTok = this.next(); // 'provides'
+      this.skipTrivia();
+      if (sawProvides) {
+        throw new DisonParseError(`A configuration can have only one "provides" clause`, providesTok.pos);
+      }
+      sawProvides = true;
+      providesKeys = this.parseProvidesKeys();
+      continue;
+    }
+    if (sawExtends) {
+      throw new DisonParseError(`A configuration can have only one "extends" clause`, this.peek().pos);
+    }
+    sawExtends = true;
+    {
       const extendsTok = this.next(); // 'extends'
       this.skipTrivia();
       const names: string[] = [];
@@ -673,6 +706,7 @@ export class Parser {
         }
       }
     }
+    }
     // フェーズ1/2: 名前付きローカル/クラス configuration（+ その activate）は未対応。
     if (scope !== "global" && name !== undefined) {
       const where = scope === "class" ? "class body" : "function/method";
@@ -710,7 +744,71 @@ export class Parser {
       );
     }
 
-    return { kind: "configuration", name, extendsNames, extendsSelections, scope, asyncScope, entries, tokenPos: configPos };
+    return { kind: "configuration", name, extendsNames, extendsSelections, providesKeys, scope, asyncScope, entries, tokenPos: configPos };
+  }
+
+  // "provides K, K, ..." のキー列をパースする（docs/configuration-provides.md §2.2）。
+  //
+  //   provides-key := <型参照> ["as" <トークン>] | <クラス名> "." <プロパティ名>
+  //
+  // 型参照と as 句は **bind 左辺と同じ規則**（parseGenericTypeRef /
+  // parseOptionalAsToken）を再利用する。これにより宣言側と実体側でキーの正規化が
+  // 一致する（食い違うと検査そのものが無意味になる）。
+  private parseProvidesKeys(): ProvidesKey[] {
+    const keys: ProvidesKey[] = [];
+    while (true) {
+      const startTok = this.peek();
+      if (startTok.type !== "ident") {
+        throw new DisonParseError(
+          `Expected a key name after "provides" but found "${startTok.text}"`,
+          startTok.pos
+        );
+      }
+      const ref = this.parseGenericTypeRef(`a "provides" key`);
+      this.skipTrivia();
+
+      // "Cls.prop" 形（override 対）。型参照にジェネリクスが付いていたら不正。
+      const dot = this.peek();
+      if (dot.type === "punct" && dot.text === ".") {
+        this.next(); // '.'
+        this.skipTrivia();
+        const propTok = this.next();
+        if (propTok.type !== "ident") {
+          throw new DisonParseError(
+            `Expected a property name after "${ref.display}." in the "provides" clause but found "${propTok.text}"`,
+            propTok.pos
+          );
+        }
+        if (ref.key !== ref.display.trim()) {
+          throw new DisonParseError(
+            `An override key in the "provides" clause must be written as "ClassName.property"`,
+            startTok.pos
+          );
+        }
+        keys.push({ kind: "override", className: ref.key, prop: propTok.text });
+      } else {
+        const token = this.parseOptionalAsToken(`a "provides" key`);
+        keys.push({ kind: "bind", typeName: ref.display.trim(), typeKey: ref.key, token });
+      }
+
+      this.skipTrivia();
+      const sep = this.peek();
+      if (sep.type === "punct" && sep.text === ",") {
+        this.next();
+        this.skipTrivia();
+        continue;
+      }
+      break;
+    }
+    const seen = new Set<string>();
+    for (const k of keys) {
+      const label = k.kind === "bind" ? `${k.typeKey}${k.token ?? ""}` : `${k.className}.${k.prop}`;
+      if (seen.has(label)) {
+        throw new DisonParseError(`"${label}" is listed twice in the same "provides" clause`, this.peek().pos);
+      }
+      seen.add(label);
+    }
+    return keys;
   }
 
   // "(条件木)" をパースする（実行時選択。docs/activate-sugar-implementation.md §1.2）。

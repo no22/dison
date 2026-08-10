@@ -8,12 +8,16 @@ import { PostgresRepository, InMemoryRepository, SystemClock, FrozenClock } from
 
 const DATABASE_URL = "postgres://localhost/app";
 
-export configuration Production {
+// `provides` (new in 3.1) states what this layer promises to wire. If a
+// later edit drops one of these binds, the build fails here rather than
+// letting a consumer's default initializer quietly take over.
+export configuration Production provides Repository, Clock {
   bind Repository = PostgresRepository(DATABASE_URL);
   bind Clock = SystemClock;
 }
 
-// Only the differences. Everything else comes from Production.
+// Only the differences. Everything else comes from Production — including
+// its promise, which Test inherits along with the bindings.
 export configuration Test extends Production {
   bind Repository = InMemoryRepository;
   bind Clock = FrozenClock("2026-01-01T00:00:00Z");

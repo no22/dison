@@ -15,7 +15,7 @@ import {
   baseIdentifierOf,
 } from "./analysis.js";
 import { collectDiUsedTypeNames } from "./codegen.js";
-import { collectInheritanceDiagnostics, overridePairKeys } from "./config-inheritance.js";
+import { collectInheritanceDiagnostics, overridePairKeys, findProvidesViolations } from "./config-inheritance.js";
 import { Parser } from "./parser.js";
 
 export interface DisonFileInput {
@@ -637,13 +637,27 @@ export function findConfigInheritanceDiagnostics(files: DisonFileInput[]): BindC
     return name;
   };
 
+  const keyNormalizer = {
+    bindKey: (entry: any, f: Pre) => `bind ${declSite(f, baseIdentifierOf(entry.originalTypeKey))}${entry.token ?? ""}`,
+    overrideKeys: (entry: any, f: Pre) => overridePairKeys(declSite(f, entry.className), entry),
+  };
+
   const diagnostics: BindCollisionDiagnostic[] = [];
   const seen = new Set<string>();
   for (const p of pre) {
-    for (const d of collectInheritanceDiagnostics<Pre>(p.ast, p, resolve, {
-      bindKey: (entry, f) => `bind ${declSite(f, baseIdentifierOf(entry.originalTypeKey))}${entry.token ?? ""}`,
-      overrideKeys: (entry, f) => overridePairKeys(declSite(f, entry.className), entry),
-    })) {
+    // `provides` 節の検査（docs/configuration-provides.md）。宣言キーの正規化は
+    // 実体側（bindKey/overrideKeys）と同じ declSite を通すことで一致させる。
+    for (const d of findProvidesViolations<Pre>(p.ast, p, resolve, keyNormalizer, (key, f) =>
+      key.kind === "bind"
+        ? `bind ${declSite(f, baseIdentifierOf(key.typeKey))}${key.token ?? ""}`
+        : `override ${declSite(f, key.className)} ${key.prop}`
+    )) {
+      const message = `${p.file.path}: ${d.message}`;
+      if (seen.has(message)) continue;
+      seen.add(message);
+      diagnostics.push({ name: "configuration", message });
+    }
+    for (const d of collectInheritanceDiagnostics<Pre>(p.ast, p, resolve, keyNormalizer)) {
       const message = `${p.file.path}: ${d.message}`;
       if (seen.has(message)) continue;
       seen.add(message);

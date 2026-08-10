@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as fs from 'fs';
 import * as path from 'path';
-import { transpileDisonToTS, explainWiring, computeProjectWiring, findUnboundInjectables, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile, computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics } from './core.js'; // ※NodeNext環境のために.jsをつけます
+import { transpileDisonToTS, explainWiring, explainProvides, computeProjectWiring, findUnboundInjectables, findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile, computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics } from './core.js'; // ※NodeNext環境のために.jsをつけます
 
 // 複数ファイルの生成コードが共有ランタイム（DI_REGISTRY/TYPE_BINDINGS等）を
 // importする際に使うパッケージのサブパス。@no22/disonパッケージ自身が
@@ -36,6 +36,7 @@ function transpileSingleFile(inputFile: string, opts: CliOptions): void {
   if (opts.explain) {
     const report = explainWiring(sourceCode);
     console.log(`📋 Static wiring for ${inputFile}:`);
+    for (const line of explainProvides(sourceCode)) console.log(`  ${line}`);
     if (report.length === 0) {
       console.log('  (no injectables)');
     } else {
@@ -158,6 +159,7 @@ function transpileMultipleFiles(inputFiles: string[], opts: CliOptions): void {
     for (const file of fileInputs) {
       const report = projectWiring.get(file.path)?.report ?? [];
       console.log(`📋 Static wiring for ${file.path}:`);
+      for (const line of explainProvides(file.source)) console.log(`  ${line}`);
       if (report.length === 0) {
         console.log('  (no injectables)');
       } else {

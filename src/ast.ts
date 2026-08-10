@@ -33,6 +33,12 @@ export interface BindEntry {
 
 export type ConfigEntry = OverrideEntry | BindEntry;
 
+// `provides` 節が列挙するキー。bind キー（型参照＋任意の as トークン）と
+// override 対（クラス名.プロパティ名）の両方を扱う。
+export type ProvidesKey =
+  | { kind: "bind"; typeName: string; typeKey: string; token?: string }
+  | { kind: "override"; className: string; prop: string };
+
 // tokenPos: そのノードの先頭トークンの「元トークン列でのインデックス」。
 // 静的解決（docs/static-resolution-design.md）が、トップレベルのフロー解析
 // （配線文と実行文の前後関係）・囲みクラスの特定・blockContext参照に使う。
@@ -73,6 +79,11 @@ export type Node =
       // extendsExternal: 宣言がこのファイルから見えないことが正常な名前
       // （`import { activateX }` 経由で知っている configuration）。未解決を診断しない。
       extendsExternal?: string[];
+      // providesKeys: `configuration P provides Repository, Service.repo { ... }` の
+      // 宣言された表面（docs/configuration-provides.md）。「少なくともこれらを提供する」
+      // という主張で、実効エントリ（extends 継承分を含む）との差分が transpile エラー。
+      // キーの構文は bind 左辺と同じ規則なので、正規化もそのまま通せる。
+      providesKeys?: ProvidesKey[];
       scope: "global" | "local" | "class";
       asyncScope?: boolean;
       entries: ConfigEntry[];

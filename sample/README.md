@@ -92,6 +92,10 @@ only), **implementations** (classes that know the contracts), **wiring**
 (`configuration`s that decide which implementation wins), and a **service**
 that declares what it needs and knows none of the above.
 
+`wiring.dis` also declares what it promises with `provides` (new in 3.1), so
+dropping a `bind` later fails the build *there* instead of silently falling
+back to a consumer's default initializer.
+
 Two 2.1 features make the separation complete:
 
 - `configuration Test extends Production { ... }` — configurations inherit

@@ -255,7 +255,7 @@ import { generateRuntimeDeclarations, DISON_RUNTIME_MODULE_SOURCE, DISON_RUNTIME
 import { computeWiringTable, type WiringTable, type WiringDecision } from "./static-wiring.js";
 import type { Node as DisonNode } from "./ast.js";
 import { computeProjectWiring, type ProjectFileWiring } from "./static-wiring-project.js";
-import { namedGlobalConfigurations, configurationsNeedingApplier, collectInheritanceDiagnostics, overridePairKeys } from "./config-inheritance.js";
+import { namedGlobalConfigurations, configurationsNeedingApplier, collectInheritanceDiagnostics, overridePairKeys, findProvidesViolations } from "./config-inheritance.js";
 import { findUnboundInjectables } from "./binding-coverage.js";
 import { findBindCollisions, findCrossFileKeyMismatches, computeIdentityKeyClassesByFile, computeCompanionPlanByFile, computeConfigExtendsPlanByFile, findConfigInheritanceDiagnostics } from "./collisions.js";
 import type { DisonFileInput, BindCollisionDiagnostic, CompanionImportInfo, ConfigExtendsPlan } from "./collisions.js";
@@ -424,6 +424,26 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
       }
     );
     if (diags.length > 0) throw new Error(diags.map((d) => d.message).join("\n"));
+
+    // `provides` 節の検査（docs/configuration-provides.md）。
+    const localResolve = (name: string) => {
+      const decl = namedConfigs.get(name);
+      return decl !== undefined ? { node: decl, file: undefined } : undefined;
+    };
+    const providesDiags = findProvidesViolations<undefined>(
+      ast,
+      undefined,
+      localResolve,
+      {
+        bindKey: (entry) => keyExprFor(entry.originalTypeKey, entry.token, strategy),
+        overrideKeys: (entry) => overridePairKeys(entry.className, entry),
+      },
+      (key) =>
+        key.kind === "bind"
+          ? keyExprFor(key.typeKey, key.token, strategy)
+          : `override ${key.className} ${key.prop}`
+    );
+    if (providesDiags.length > 0) throw new Error(providesDiags.map((d) => d.message).join("\n"));
   }
 
   // フレームへの展開（関数本体・クラス本体の `configuration extends X {}`）は、X の
@@ -554,6 +574,28 @@ export function transpileDisonToTS(sourceCode: string, options: TranspileOptions
       : "";
 
   return prelude + companionImportsStr + fromImports + extendsImportsStr + factoryImportsStr + companionDecls + body + factoryExportsStr;
+}
+
+/**
+ * ソース中の configuration が宣言した表面（`provides` 節）を人間可読な行にして返す。
+ * --explain が判定表の前に表示する（docs/configuration-provides-implementation.md §4）。
+ * explainWiring の返り値は変えない（判定行のインデックスに依存した利用があるため）。
+ */
+export function explainProvides(sourceCode: string): string[] {
+  const tokens = new Lexer(sourceCode).tokenize();
+  const typeKinds = collectDeclaredTypeKinds(tokens);
+  const ast = new Parser(tokens, typeKinds).parseProgram();
+  const out: string[] = [];
+  for (const node of ast) {
+    if (node.kind !== "configuration" || node.providesKeys === undefined) continue;
+    const shown = node.providesKeys
+      .map((k) =>
+        k.kind === "bind" ? k.typeName + (k.token !== undefined ? ` as ${k.token}` : "") : `${k.className}.${k.prop}`
+      )
+      .join(", ");
+    out.push(`${node.name ?? "(anonymous)"} provides {${shown}}`);
+  }
+  return out;
 }
 
 /**
